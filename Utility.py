@@ -7,6 +7,9 @@ from numpy.linalg import norm
 import statistics as stat
 from functools import reduce
 from tslearn.metrics import dtw
+import GlobalPaths
+
+import GlobalPaths
 
 path_to_ecg_files = 'Data/ECG'
 path_to_ecg_meta = 'Data/scar_dataset.xlsx'
@@ -38,7 +41,7 @@ class Util:
         threshold = round(0.5 * frequency)
         if wave == 'T' or wave == 'P':
             threshold = round(1 * frequency)
-        elif wave == 'Ventricular':
+        elif wave == 'QT':
             threshold = round(0.9 * hb_interval)
 
         closest_index = -1
@@ -127,35 +130,18 @@ class Loader:
 
     @staticmethod
     def get_ecg_pid_pair_list():
-        ann_names = [f for f in os.listdir(path_to_pla_ann) if not f.startswith('.')]
-        ecg_ids = []
-        for ann_name in ann_names:
-            ecg_ids.append(int(ann_name.split('_')[0]))
-        ecg_ids = list(set(ecg_ids))
-        meta = pd.read_excel(path_to_ecg_meta)
-        frequency_list = []
-        pid_list = []
-        for ecg_id in ecg_ids:
-            try:
-                frequency = int(meta.loc[meta['First ECG'] == ecg_id - 1]['Frequency'].values[0])
-                frequency_list.append(frequency)
-            except:
-                frequency_list.append(None)
-            try:
-                pid = int(meta.loc[meta['First ECG'] == ecg_id - 1]['Record ID'].values[0])
-                pid_list.append(pid)
-            except:
-                pid_list.append(None)
+        meta = pd.read_excel(GlobalPaths.cached_scar_ecg_meta)
+        ecg_ids = list(meta['ECG ID'].values)
+        pid_list = list(meta['Record_ID'].values)
+        frequency_list = list(meta['Sample Base'].values)
         return ecg_ids, pid_list, frequency_list
 
     @staticmethod
     def fast_get_ecg(ecg_id: int, frequency: int, denoise=True) -> pd.DataFrame:
-        path = os.path.join(path_to_ecg_files, str(ecg_id) + '.csv')
+        path = os.path.join(GlobalPaths.ecg, str(ecg_id) + '.csv')
         ecg = pd.read_csv(filepath_or_buffer=path,
                           header=None, skiprows=1,
-                          names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'e'])
-        ecg.drop(ecg.columns[len(ecg.columns) - 1], axis=1, inplace=True)
-
+                          names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'])
         if denoise:
             for lead in ecg:
                 lead_ecg = ecg[lead]
@@ -163,28 +149,28 @@ class Loader:
                 ecg[lead] = filtered
         return ecg
 
-    @staticmethod
-    def get_ecg(ecg_id: int, denoise=True) -> [pd.DataFrame, int]:
-        meta = pd.read_excel(path_to_ecg_meta)
-        try:
-            frequency = int(meta.loc[meta['First ECG'] == ecg_id-1]['Frequency'].values[0])
-            pid = int(meta.loc[meta['First ECG'] == ecg_id - 1]['Record ID'].values[0])
-            path = os.path.join(path_to_ecg_files, str(ecg_id) + '.csv')
-            ecg = pd.read_csv(filepath_or_buffer=path,
-                              header=None, skiprows=1,
-                              names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'e'])
-            ecg.drop(ecg.columns[len(ecg.columns) - 1], axis=1, inplace=True)
-
-            if denoise:
-                for lead in ecg:
-                    lead_ecg = ecg[lead]
-                    filtered = SignalProcessing.filter(sig=lead_ecg, frequency=frequency)
-                    ecg[lead] = filtered
-            return [ecg, frequency, pid]
-        except KeyError:
-            assert False, 'Could not find meta data for ECG ' + str(ecg_id)
-        except IndexError:
-            assert False, 'ECG ' + str(ecg_id) + ' does not have sample frequency.'
+    # @staticmethod
+    # def get_ecg(ecg_id: int, denoise=True) -> [pd.DataFrame, int]:
+    #     meta = pd.read_excel(path_to_ecg_meta)
+    #     try:
+    #         frequency = int(meta.loc[meta['First ECG'] == ecg_id-1]['Frequency'].values[0])
+    #         pid = int(meta.loc[meta['First ECG'] == ecg_id - 1]['Record ID'].values[0])
+    #         path = os.path.join(path_to_ecg_files, str(ecg_id) + '.csv')
+    #         ecg = pd.read_csv(filepath_or_buffer=path,
+    #                           header=None, skiprows=1,
+    #                           names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'e'])
+    #         ecg.drop(ecg.columns[len(ecg.columns) - 1], axis=1, inplace=True)
+    #
+    #         if denoise:
+    #             for lead in ecg:
+    #                 lead_ecg = ecg[lead]
+    #                 filtered = SignalProcessing.filter(sig=lead_ecg, frequency=frequency)
+    #                 ecg[lead] = filtered
+    #         return [ecg, frequency, pid]
+    #     except KeyError:
+    #         assert False, 'Could not find meta data for ECG ' + str(ecg_id)
+    #     except IndexError:
+    #         assert False, 'ECG ' + str(ecg_id) + ' does not have sample frequency.'
 
     @staticmethod
     def _correct_annotations(ann_list):
@@ -209,9 +195,9 @@ class Loader:
         p_ann_name = str(ecg_id) + '_P.mat'
         qrs_ann_name = str(ecg_id) + '_QRS.mat'
         t_ann_name = str(ecg_id) + '_T.mat'
-        p_ann = loadmat(os.path.join(path_to_pla_ann, p_ann_name))
-        qrs_ann = loadmat(os.path.join(path_to_pla_ann, qrs_ann_name))
-        t_ann = loadmat(os.path.join(path_to_pla_ann, t_ann_name))
+        p_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, p_ann_name))
+        qrs_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, qrs_ann_name))
+        t_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, t_ann_name))
 
         p_start = Loader._correct_annotations(p_ann['P_anns']['onset'])
         p_peak = Loader._correct_annotations(p_ann['P_anns']['peak'])

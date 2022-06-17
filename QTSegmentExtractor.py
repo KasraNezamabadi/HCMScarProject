@@ -11,23 +11,20 @@ class QTSegmentExtractor:
         self.column_names = ['P Start', 'P End', 'QRS Start', 'QRS End', 'T Start', 'T End']
         self.verbose = verbose
 
-    def extract_segments(self, num_ecgs: int = None):
-        if num_ecgs is None:
-            num_ecgs = len(self.ecg_ids)
-
+    def extract_segments(self):
         results = {}
-        for i in range(num_ecgs):
+        for i in range(len(self.ecg_ids)):
             ecg_id = self.ecg_ids[i]
             pid = self.pids[i]
             frequency = self.frequency_list[i]
-            # if pid != 10338:
-            #     continue
             segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
             if pid in segment_dict:
                 p_results_dict = segment_dict[pid]
                 results[pid] = p_results_dict
-            if self.verbose and i != 0 and i % 20 == 0:
-                print(f'--- {round(i/num_ecgs * 100)}% Done')
+            else:
+                print(f'Skipping {pid}')
+            if self.verbose and i != 0 and i % 50 == 0:
+                print(f'--- {round(i/len(self.ecg_ids) * 100)}% Done')
 
         return results
 
@@ -35,7 +32,11 @@ class QTSegmentExtractor:
         results = {}
         ecg = Loader.fast_get_ecg(ecg_id=ecg_id, frequency=frequency)
         # print(f'Extracting segments from PID = {pid}')
+
         ann = Loader.get_annotations(ecg_id=ecg_id)
+
+        if pid == 10844:
+            v = 9
 
         for index, row in ann.iterrows():
             lead_ecg = ecg[Util.get_lead_name(index=index)].values
@@ -61,7 +62,7 @@ class QTSegmentExtractor:
         for lead_qrs_peak in qrs_peaks:
             for i in range(len(lead_qrs_peak) - 1):
                 hb_interval = lead_qrs_peak[i+1] - lead_qrs_peak[i]
-                if hb_interval < 2 * frequency:
+                if hb_interval < 2.03 * frequency:  # -> It was 2, but because of PID 10844 I changed it to 2.03
                     sum_hb_intervals += hb_interval
                     count_hb += 1
         if count_hb == 0:
@@ -83,13 +84,14 @@ class QTSegmentExtractor:
                 try:
                     offset = Util.get_offset(onset=qrs_onset, offset_list=lead_t_offsets,
                                              frequency=frequency,
-                                             wave='Ventricular',
+                                             wave='QT',
                                              hb_interval=hb_interval)
                     qt_segment = list(ecg.iloc[qrs_onset:offset + 1, lead].values)
                     qt_segments.append(qt_segment)
                     qt_bounds.append([qrs_onset, offset])
                     count_qt += 1
                 except NoOffsetException:
+                    v = 9
                     pass
             all_lead_bounds.append(qt_bounds)
         outlier_bounds = {'II': [], 'III': [], 'aVF': [], 'V2': []}
@@ -127,7 +129,6 @@ class QTSegmentExtractor:
                                 if not interval_already_exists:
                                     outlier_bounds[lead_name].append(bound)
 
-        # Here
         if not is_not_equal:
             lead_index = 0
             bounds_selected = []
@@ -291,7 +292,8 @@ class QTSegmentExtractor:
 
             if pid in results:
                 segments = results[pid]
-                results[pid] = {'segments': segments,
+                results[pid] = {'ecg_denoised': ecg,
+                                'segments': segments,
                                 'hb_interval': hb_interval,
                                 'qt_distances': qt_distances,
                                 'frequency': frequency,
@@ -301,9 +303,6 @@ class QTSegmentExtractor:
             return results
         else:
             return {}
-
-
-
 
     @staticmethod
     def is_identical(ts1: [float], ts2: [float]):
