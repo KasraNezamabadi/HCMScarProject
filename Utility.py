@@ -296,38 +296,23 @@ class SignalProcessing:
         return y
 
     @staticmethod
-    def get_peaks(segment: [int]):
-        amp_onset = segment[0]
-        amp_offset = segment[-1]
-        amp_baseline = stat.mean([amp_onset, amp_offset])
+    def get_peaks(segment: [float]):
+        amp_baseline = stat.mean([segment[0], segment[-1]])
         max_point = (list(segment).index(max(segment)), max(segment))
         min_point = (list(segment).index(min(segment)), min(segment))
-        max_baseline_divergence = max_point[1] - amp_baseline
+        max_base_div = max_point[1] - amp_baseline
         global_extremum = max_point[0]
-        if abs(min_point[1]) > abs(max_point[1]):
-            segment = [x * -1 for x in segment]
-            max_baseline_divergence = amp_baseline - min_point[1]
-            global_extremum = min_point[0]
+        # if abs(min_point[1]) > abs(max_point[1]):
+        #     max_base_div = amp_baseline - min_point[1]
+        #     global_extremum = min_point[0]
 
-        second_level_maxima, bb = signal.find_peaks(x=segment, prominence=max_baseline_divergence/2)
-        third_level_maxima, bb = signal.find_peaks(x=segment,
-                                                   prominence=(
-                                                       max_baseline_divergence / 3, max_baseline_divergence / 2))
-        fourth_level_maxima, bb = signal.find_peaks(x=segment,
-                                                   prominence=(
-                                                       max_baseline_divergence / 4, max_baseline_divergence / 3))
-        fifth_level_maxima, bb = signal.find_peaks(x=segment,
-                                                   prominence=(
-                                                       max_baseline_divergence / 5, max_baseline_divergence / 4))
-        sixth_level_maxima, bb = signal.find_peaks(x=segment,
-                                                   prominence=(
-                                                       max_baseline_divergence / 10, max_baseline_divergence / 5))
-        seventh_level_maxima, bb = signal.find_peaks(x=segment,
-                                                   prominence=(
-                                                       max_baseline_divergence / 20, max_baseline_divergence / 10))
-        last_level_maxima, bb = signal.find_peaks(x=segment,
-                                                  prominence=(
-                                                      max_baseline_divergence / 30, max_baseline_divergence / 20))
+        second_level_maxima, bb = signal.find_peaks(x=segment, prominence=max_base_div/2)
+        third_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 3, max_base_div / 2))
+        fourth_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 4, max_base_div / 3))
+        fifth_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 5, max_base_div / 4))
+        sixth_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 10, max_base_div / 5))
+        seventh_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 20, max_base_div / 10))
+        last_level_maxima, bb = signal.find_peaks(x=segment, prominence=(max_base_div / 30, max_base_div / 20))
 
         set1 = set([global_extremum])
         set2 = set(second_level_maxima)
@@ -344,13 +329,7 @@ class SignalProcessing:
         set6 = set6 - set1
         set7 = set7 - set1
 
-        v = 9
-
-
-        maxima, _ = signal.find_peaks(x=segment)
-        segment_inverted = [x * -1 for x in segment]
-        [minima, dict_minima] = signal.find_peaks(x=segment_inverted)
-        return maxima, minima
+        return [list(set1), list(set2), list(set3), list(set4), list(set5), list(set6), list(set7), list(set8)]
 
     def get_significant_points(self, segment: [int], threshold: float):
         significant_points = []

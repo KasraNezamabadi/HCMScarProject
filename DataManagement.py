@@ -31,9 +31,13 @@ import GlobalPaths
 class Distance:
     @staticmethod
     def compute_hvdm_matrix(input_df: pd.DataFrame, y_ix: [int], cat_ix: [int]):
-        print(f'Computing pair-wise HVDM distance for {input_df.shape[0]} data points')
+        print(f'--- Computing pair-wise HVDM distance for {input_df.shape[0]} data points')
         ehr_matrix = input_df.values
-        ehr_matrix = ehr_matrix[:, :-1]
+        # TODO -> THis function is used by two classes. Currently, it assumes that Record_ID is the first column,
+        #  which is true for augmentation. But for imputation you need to bring record_id to the first column.
+        if list(input_df.columns.values)[0] != 'Record_ID':
+            assert 'Record_ID must be the first column in EHR data frame'
+        ehr_matrix = ehr_matrix[:, 1:]  # Remove Record_ID which is the first column!
         hvdm_metric = HVDM(X=ehr_matrix, y_ix=y_ix, cat_ix=cat_ix)
 
         dist_matrix = np.empty(shape=(len(ehr_matrix), len(ehr_matrix)), dtype=object)
@@ -44,7 +48,7 @@ class Distance:
                     s_time = time()
                     x = ehr_matrix[i]
                     y = ehr_matrix[j]
-                    dist = hvdm_metric.hvdm(x=x, y=y, missing_values=None)
+                    dist = hvdm_metric.hvdm(x=x, y=y)
                     dist_matrix[i, j] = (dist, input_df.iloc[j]['Record_ID'], input_df.iloc[j])
                     e_time = time()
                     if len(time_log) < 3:
@@ -56,7 +60,6 @@ class Distance:
                         print(f'ETA = {total_time} seconds')
                         time_log.append(-1)
 
-        print('Copying lower triangle')
         for i in range(len(ehr_matrix) - 1, 0, -1):
             for j in range(len(ehr_matrix)):
                 if j < i:
@@ -65,6 +68,7 @@ class Distance:
 
     @staticmethod
     def compute_ecg_distance_matrix(ecg_ds: np.ndarray):
+        print(f'--- Computing pair-wise ECG distance for {ecg_ds.shape[0]} data points')
         dist_matrix = np.empty(shape=(len(ecg_ds), len(ecg_ds), 4), dtype=object)
         for i in range(len(ecg_ds)):
             for j in range(len(ecg_ds)):
@@ -73,7 +77,6 @@ class Distance:
                         dist = Util.get_qt_distance(p1=ecg_ds[i], p2=ecg_ds[j], lead_index=lead_index)
                         dist_matrix[i, j, lead_index] = (ecg_ds[j]['pid'], dist, ecg_ds[j]['preprocessed'])
 
-        print('Copying lower triangle')
         for i in range(len(ecg_ds) - 1, 0, -1):
             for j in range(len(ecg_ds)):
                 if j < i:
@@ -690,11 +693,12 @@ class EHRECGParser(EHRBaseParser):
         print(f'Saving Dataset at {GlobalPaths.qt_segment_dataset}')
         np.save(file=os.path.join(GlobalPaths.qt_segment_dataset, 'qt_segment_dataset'), arr=patient_dataset)
 
+
 class EHRFeatureSelection:
     def __init__(self, ehr_df: pd.DataFrame):
         self.ehr_df = ehr_df
 
-    def get_top_nominal_features(self, min_info_gain: float = 0.001):
+    def get_top_nominal_features(self, min_info_gain: float = 0.002):
         all_features = EHRAttributeManager.get_nominal_attrs(include_record_id=False)
         ig_list = []
         for feature in all_features:
@@ -924,16 +928,118 @@ class EHRFeatureSelection:
 
 class ScarAugmentor:
     def __init__(self, ehr_df: pd.DataFrame, ecg_ds: np.ndarray):
+        if list(ehr_df.columns.values)[0] != 'Record_ID':
+            assert 'Record_ID must be the first column in EHR data frame'
         self.ehr_df = ehr_df.sort_values(by='Record_ID')
         self.ehr_df = self.ehr_df.reset_index(drop=True)
-        self.ecg_ds = np.array(sorted(ecg_ds, key=lambda item: item['pid']), dtype=dict)
+        if len(ecg_ds) > 0:
+            self.ecg_ds = np.array(sorted(ecg_ds, key=lambda item: item['pid']), dtype=dict)
+
+    def smote_ehr(self, k_nearest: int = 5):
+        y_ix = []
+        cat_ix = []
+        nominal_set = set(EHRAttributeManager.get_nominal_attrs(include_record_id=False))
+        col_list = list(self.ehr_df.columns.values)
+        for col_index in range(len(col_list)):
+            attribute_name = col_list[col_index]
+            if attribute_name == 'DE':
+                y_ix.append(col_index - 1)
+                # Why -1? -> Record_id will be removed when computing distance,
+                # so all indexes must be shifted one to the left (record_id is the first column!).
+            elif attribute_name in nominal_set:
+                cat_ix.append(col_index - 1)
+
+        ehr_dist_matrix = Distance.compute_hvdm_matrix(input_df=self.ehr_df, y_ix=y_ix, cat_ix=cat_ix)
+
+        ehr_augmented_list = []
+        for i in range(len(ehr_dist_matrix)):
+            row = self.ehr_df.iloc[i]
+            if row['DE'] == 1:
+                continue
+            neighbour_distances = []
+            for j in range(len(ehr_dist_matrix)):
+                ecg_dist_neighbor_over_leads = []
+                ehr_dist_neighbor_over_leads = []
+                if i != j:
+                    dist = ehr_dist_matrix[i, j][0]
+                    n_object = ehr_dist_matrix[i, j][2]
+                    neighbour_distances.append((dist, n_object))
+                else:
+                    neighbour_distances.append(None)
+
+            neighbour_distances = np.array([x for x in neighbour_distances if not pd.isna(x)], dtype=object)
+            sorted_nn = sorted(neighbour_distances, key=lambda item: item[0])
+            nn_list = []
+            for nn in sorted_nn:
+                dist = nn[0]
+                neighbor = nn[1]
+                if neighbor['DE'] == 0:
+                    nn_list.append((dist, neighbor))
+                if len(nn_list) == k_nearest:
+                    break
+
+            ix = random.randint(0, k_nearest - 1)
+            selected_neighbor = nn_list[ix][1]
+            alpha = random.uniform(0, 1)
+            augmented_dict = {}
+            for attribute_name, value in row.iteritems():
+                if attribute_name == 'DE':
+                    augmented_dict['DE'] = 0
+                elif attribute_name == 'Record_ID':
+                    augmented_dict['Record_ID'] = 1000000 + value
+                else:
+                    attr_object = EHRAttributeManager.get_attr_object(for_record_name=attribute_name)
+                    if attr_object.is_nominal():
+                        category_main = value
+                        category_neighbor = selected_neighbor[attr_object.record_name]
+                        if category_main == category_neighbor:
+                            augmented_dict[attr_object.record_name] = category_main
+                        else:
+                            nn_attr_counter = Counter(
+                                [int(neighbor[1][attr_object.record_name]) for neighbor in nn_list])
+                            most_common = nn_attr_counter.most_common(n=1)
+                            voted_category = most_common[0][0]
+                            augmented_dict[attr_object.record_name] = voted_category
+                    else:  # -> Attribute is continuous
+                        value_main = value
+                        value_neighbor = selected_neighbor[attr_object.record_name]
+                        augmented_value = (alpha * value_main) + ((1 - alpha) * value_neighbor)
+                        augmented_dict[attr_object.record_name] = augmented_value
+            ehr_augmented_list.append(augmented_dict)
+
+        return pd.DataFrame(ehr_augmented_list)
+
 
     def smote_ehr_ecg(self, k_nearest: int = 5, dist_mode: str = 'both'):
-        print(f'Performing SMOTE augmentation with {dist_mode} mode on {self.ehr_df.shape[0]} data points')
+        '''
+        To augment ECG part of sample s:
+            Step 1 -> Randomly select a neighbor s' from K nearest neighbors.
+            For each lead:
+                Step 2 -> Randomly select a QT segment from s and another QT segment from s'
+                Step 3 -> Average the QT segments (weighted uniformly) = Generated QT segment
+            Step 4 -> Stack up the generated QT segments
+        '''
+        if dist_mode == 'both' and self.ehr_df.shape[0] != self.ecg_ds.shape[0]:
+            assert 'EHR and ECG Dataset must have same number of data points for `both` mode augmentation'
+        print(f'\nPerforming SMOTE augmentation with {dist_mode} mode on {self.ehr_df.shape[0]} data points')
         ehr_dist_matrix = None
         ecg_dist_matrix = None
         if dist_mode == 'ehr' or dist_mode == 'both':
-            ehr_dist_matrix = Distance.compute_hvdm_matrix(input_df=self.ehr_df, y_ix=[0], cat_ix=list(range(1, 13)))
+
+            y_ix = []
+            cat_ix = []
+            nominal_set = set(EHRAttributeManager.get_nominal_attrs(include_record_id=False))
+            col_list = list(self.ehr_df.columns.values)
+            for col_index in range(len(col_list)):
+                attribute_name = col_list[col_index]
+                if attribute_name == 'DE':
+                    y_ix.append(col_index-1)
+                    # Why -1? -> Record_id will be removed when computing distance,
+                    # so all indexes must be shifted one to the left (record_id is the first column!).
+                elif attribute_name in nominal_set:
+                    cat_ix.append(col_index-1)
+
+            ehr_dist_matrix = Distance.compute_hvdm_matrix(input_df=self.ehr_df, y_ix=y_ix, cat_ix=cat_ix)
         if dist_mode == 'ecg' or dist_mode == 'both':
             ecg_dist_matrix = Distance.compute_ecg_distance_matrix(self.ecg_ds)
 
@@ -1087,7 +1193,7 @@ class ScarAugmentor:
                             dist += ehr_dist_norm
                         if ecg_dist_norm is not None:
                             dist += ecg_dist_norm
-                        # -> Append i distance from all j neighbors for lead_index
+                        # -> Append distance from i to all j neighbors for lead_index
                         neighbour_distances.append(
                             (dist, ehr_ecg_distance.other_ehr_object, ehr_ecg_distance.other_ecg_object))
                 neighbour_distances = np.array([x for x in neighbour_distances if not pd.isna(x)], dtype=object)
@@ -1102,38 +1208,59 @@ class ScarAugmentor:
                     if len(nn_list) == k_nearest:
                         break
 
-                nearest_mean_segments = []
-                for other_p_object in nn_list:
-                    segments = np.array(other_p_object[1]['preprocessed'])
-                    segments = segments[:, lead_index, :]  # -> will be of shape m x 96, where m is the number of hb
-                    mean_segment = softdtw_barycenter(segments, gamma=0.1, max_iter=10, tol=1e-3)
-                    mean_segment = np.reshape(mean_segment, mean_segment.shape[0])
-                    mean_segment = SignalProcessing.smooth_two_third(mean_segment)
-                    nearest_mean_segments.append(mean_segment)
+                selected_neighbor = nn_list[random.randint(0, len(nn_list) - 1)]
+                selected_neighbor_qt_segments = selected_neighbor[1]['preprocessed']
+                neighbor_segments = selected_neighbor_qt_segments[
+                    random.randint(0, len(selected_neighbor_qt_segments) - 1)]
+                neighbor_segment = neighbor_segments[lead_index, :]
 
-                segments = np.array(p_object['preprocessed'])
-                mean_segment = softdtw_barycenter(segments[:, lead_index, :], gamma=0.1, max_iter=10, tol=1e-3)
-                mean_segment = np.reshape(mean_segment, mean_segment.shape[0])
-                mean_segment = SignalProcessing.smooth_two_third(mean_segment)
-                main_segment = mean_segment
+                main_segments = p_object['preprocessed']
+                main_segment = main_segments[random.randint(0, len(main_segments) - 1)]
+                main_segment = main_segment[lead_index, :]
 
-                new_lead_segments = []
-                for neighbor_segment in nearest_mean_segments:
-                    temp_for_mean = [main_segment, neighbor_segment]
-                    interpolate_1 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.5, 0.5])
-                    interpolate_2 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.25, 0.75])
-                    interpolate_3 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.75, 0.25])
-                    interpolate_1 = np.reshape(interpolate_1, interpolate_1.shape[0])
-                    interpolate_2 = np.reshape(interpolate_2, interpolate_2.shape[0])
-                    interpolate_3 = np.reshape(interpolate_3, interpolate_3.shape[0])
-                    interpolate_1 = SignalProcessing.smooth_two_third(interpolate_1)
-                    interpolate_2 = SignalProcessing.smooth_two_third(interpolate_2)
-                    interpolate_3 = SignalProcessing.smooth_two_third(interpolate_3)
-                    new_lead_segments.append(interpolate_1)
-                    new_lead_segments.append(interpolate_2)
-                    new_lead_segments.append(interpolate_3)
-                new_lead_segments = np.array(new_lead_segments)
-                new_segment.append(new_lead_segments)
+                generated_segment = softdtw_barycenter(X=[main_segment, neighbor_segment], gamma=0.8)
+                generated_segment = np.reshape(generated_segment, generated_segment.shape[0])
+                generated_segment = SignalProcessing.smooth_two_third(generated_segment)
+                fig, ax = plt.subplots(3)
+                ax[0].plot(main_segment)
+                ax[1].plot(neighbor_segment)
+                ax[2].plot(generated_segment)
+                plt.show()
+                new_segment.append(generated_segment)
+                v = 9
+
+                # nearest_mean_segments = []
+                # for other_p_object in nn_list:
+                #     segments = np.array(other_p_object[1]['preprocessed'])
+                #     segments = segments[:, lead_index, :]  # -> will be of shape m x 96, where m is the number of hb
+                #     mean_segment = softdtw_barycenter(segments, gamma=0.1, max_iter=10, tol=1e-3)
+                #     mean_segment = np.reshape(mean_segment, mean_segment.shape[0])
+                #     mean_segment = SignalProcessing.smooth_two_third(mean_segment)
+                #     nearest_mean_segments.append(mean_segment)
+                #
+                # segments = np.array(p_object['preprocessed'])
+                # mean_segment = softdtw_barycenter(segments[:, lead_index, :], gamma=0.1, max_iter=10, tol=1e-3)
+                # mean_segment = np.reshape(mean_segment, mean_segment.shape[0])
+                # mean_segment = SignalProcessing.smooth_two_third(mean_segment)
+                # main_segment = mean_segment
+                #
+                # new_lead_segments = []
+                # for neighbor_segment in nearest_mean_segments:
+                #     temp_for_mean = [main_segment, neighbor_segment]
+                #     interpolate_1 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.5, 0.5])
+                #     interpolate_2 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.25, 0.75])
+                #     interpolate_3 = softdtw_barycenter(X=temp_for_mean, gamma=1, weights=[0.75, 0.25])
+                #     interpolate_1 = np.reshape(interpolate_1, interpolate_1.shape[0])
+                #     interpolate_2 = np.reshape(interpolate_2, interpolate_2.shape[0])
+                #     interpolate_3 = np.reshape(interpolate_3, interpolate_3.shape[0])
+                #     interpolate_1 = SignalProcessing.smooth_two_third(interpolate_1)
+                #     interpolate_2 = SignalProcessing.smooth_two_third(interpolate_2)
+                #     interpolate_3 = SignalProcessing.smooth_two_third(interpolate_3)
+                #     new_lead_segments.append(interpolate_1)
+                #     new_lead_segments.append(interpolate_2)
+                #     new_lead_segments.append(interpolate_3)
+                # new_lead_segments = np.array(new_lead_segments)
+                # new_segment.append(new_lead_segments)
 
             new_segments = np.array(new_segment)
             results = []
@@ -1153,16 +1280,20 @@ class ScarAugmentor:
         return pd.DataFrame(ehr_augmented_list), np.array(ecg_augmented_list)
 
 
-# if __name__ == '__main__':
-#
-#     parser = EHRECGParser()
-#     feature_selector = EHRFeatureSelection(ehr_df=parser.ehr_df_imputed)
-#     top_nominal_features = feature_selector.get_top_nominal_features()
-#     top_continuous_features = feature_selector.get_top_continuous_features()
-#     vv = ScarAugmentor(ehr_df=parser.ehr_df_imputed, ecg_ds=parser.qt_dataset)
-#     v = 9
-#     # v = parser.qt_dataset
-#     # vv = parser.ehr_df_imputed
+if __name__ == '__main__':
+
+    parser = EHRECGParser()
+    feature_selector = EHRFeatureSelection(ehr_df=parser.ehr_df_imputed)
+    # pair = feature_selector.compute_information_gain(for_discrete_vars=True)
+    # feature_selector.plot_feature_score(feature_score_pair=pair, y_title='Information Gain')
+    result = feature_selector.compute_welch_t_test()
+    feature_selector.plot_feature_score(feature_score_pair=result, y_title='p-value', y_limit=0.05)
+    # top_nominal_features = feature_selector.get_top_nominal_features()
+    # top_continuous_features = feature_selector.get_top_continuous_features()
+    # vv = ScarAugmentor(ehr_df=parser.ehr_df_imputed, ecg_ds=parser.qt_dataset)
+    v = 9
+    # v = parser.qt_dataset
+    # vv = parser.ehr_df_imputed
 #
 #     print('Done!')
     # feature_explorer = EHRFeatureSelection(ehr_df=parser.ehr_df_imputed)
