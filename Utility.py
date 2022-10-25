@@ -7,13 +7,6 @@ from numpy.linalg import norm
 import statistics as stat
 from functools import reduce
 from tslearn.metrics import dtw
-import GlobalPaths
-
-import GlobalPaths
-
-path_to_ecg_files = 'Data/ECG'
-path_to_ecg_meta = 'Data/scar_dataset.xlsx'
-path_to_pla_ann = 'Data/PLAAnnotation'
 
 
 class WaveBoundaryException(Exception):
@@ -73,14 +66,14 @@ class Util:
 
         return closest_match
 
-    @staticmethod
-    def get_ecg_list() -> [int]:
-        ann_names = [f for f in os.listdir(path_to_pla_ann) if not f.startswith('.')]
-        ecg_ids = []
-        for ann_name in ann_names:
-            ecg_ids.append(int(ann_name.split('_')[0]))
-        ecg_ids = list(set(ecg_ids))
-        return ecg_ids
+    # @staticmethod
+    # def get_ecg_list() -> [int]:
+    #     ann_names = [f for f in os.listdir(path_to_pla_ann) if not f.startswith('.')]
+    #     ecg_ids = []
+    #     for ann_name in ann_names:
+    #         ecg_ids.append(int(ann_name.split('_')[0]))
+    #     ecg_ids = list(set(ecg_ids))
+    #     return ecg_ids
 
     @staticmethod
     def get_lead_name(index: int):
@@ -89,7 +82,9 @@ class Util:
 
     @staticmethod
     def get_lead_id(lead_name: str):
-        names = {'I':0, 'II':1, 'III':2, 'aVR':3, 'aVL':4, 'aVF':5, 'V1':6, 'V2':7, 'V3':8, 'V4':9, 'V5':10, 'V6':11, 'e':12}
+        names = {'I': 0, 'II': 1, 'III': 2,
+                 'aVR': 3, 'aVL': 4, 'aVF': 5,
+                 'V1': 6, 'V2': 7, 'V3': 8, 'V4': 9, 'V5': 10, 'V6': 11, 'e': 12}
         return names[lead_name]
 
     @staticmethod
@@ -129,16 +124,15 @@ class Util:
 class Loader:
 
     @staticmethod
-    def get_ecg_pid_pair_list():
-        meta = pd.read_excel(GlobalPaths.cached_scar_ecg_meta)
+    def metadata(metadata_path: str):
+        meta = pd.read_excel(metadata_path)
         ecg_ids = list(meta['ECG ID'].values)
         pid_list = list(meta['Record_ID'].values)
         frequency_list = list(meta['Sample Base'].values)
         return ecg_ids, pid_list, frequency_list
 
     @staticmethod
-    def fast_get_ecg(ecg_id: int, frequency: int, denoise=True) -> pd.DataFrame:
-        path = os.path.join(GlobalPaths.ecg, str(ecg_id) + '.csv')
+    def ecg(path: str, frequency: int, denoise=True) -> pd.DataFrame:
         ecg = pd.read_csv(filepath_or_buffer=path,
                           header=None, skiprows=1,
                           names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'])
@@ -149,55 +143,14 @@ class Loader:
                 ecg[lead] = filtered
         return ecg
 
-    # @staticmethod
-    # def get_ecg(ecg_id: int, denoise=True) -> [pd.DataFrame, int]:
-    #     meta = pd.read_excel(path_to_ecg_meta)
-    #     try:
-    #         frequency = int(meta.loc[meta['First ECG'] == ecg_id-1]['Frequency'].values[0])
-    #         pid = int(meta.loc[meta['First ECG'] == ecg_id - 1]['Record ID'].values[0])
-    #         path = os.path.join(path_to_ecg_files, str(ecg_id) + '.csv')
-    #         ecg = pd.read_csv(filepath_or_buffer=path,
-    #                           header=None, skiprows=1,
-    #                           names=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'e'])
-    #         ecg.drop(ecg.columns[len(ecg.columns) - 1], axis=1, inplace=True)
-    #
-    #         if denoise:
-    #             for lead in ecg:
-    #                 lead_ecg = ecg[lead]
-    #                 filtered = SignalProcessing.filter(sig=lead_ecg, frequency=frequency)
-    #                 ecg[lead] = filtered
-    #         return [ecg, frequency, pid]
-    #     except KeyError:
-    #         assert False, 'Could not find meta data for ECG ' + str(ecg_id)
-    #     except IndexError:
-    #         assert False, 'ECG ' + str(ecg_id) + ' does not have sample frequency.'
-
     @staticmethod
-    def _correct_annotations(ann_list):
-        result = []
-        for lead_ann in ann_list:
-            if type(lead_ann) is not list:
-                lead_ann = [lead_ann]
-            lead_result = []
-            for ann in lead_ann:
-                if type(ann) is list:
-                    if len(ann) == 0:
-                        continue
-                    lead_result.append([ann[0] - 1, ann[1] - 1])
-                else:
-                    lead_result.append(ann-1)
-            result.append(lead_result)
-        return result
-
-
-    @staticmethod
-    def get_annotations(ecg_id: int) -> [pd.DataFrame]:
+    def pla_annotation(ann_folder_path: str, ecg_id: int) -> [pd.DataFrame]:
         p_ann_name = str(ecg_id) + '_P.mat'
         qrs_ann_name = str(ecg_id) + '_QRS.mat'
         t_ann_name = str(ecg_id) + '_T.mat'
-        p_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, p_ann_name))
-        qrs_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, qrs_ann_name))
-        t_ann = loadmat(os.path.join(GlobalPaths.pla_annotation, t_ann_name))
+        p_ann = loadmat(os.path.join(ann_folder_path, p_ann_name))
+        qrs_ann = loadmat(os.path.join(ann_folder_path, qrs_ann_name))
+        t_ann = loadmat(os.path.join(ann_folder_path, t_ann_name))
 
         p_start = Loader._correct_annotations(p_ann['P_anns']['onset'])
         p_peak = Loader._correct_annotations(p_ann['P_anns']['peak'])
@@ -226,26 +179,22 @@ class Loader:
 
         return final_df
 
-    # @staticmethod
-    # def get_gt_fqrs(ecg_id: int) -> [bool, bool, bool]:
-    #     fqrs_gt = pd.read_excel(path_to_fqrs_gt)
-    #     fqrs_gt = fqrs_gt.loc[fqrs_gt['ECG ID'] == ecg_id]
-    #     if fqrs_gt.empty:
-    #         raise KeyError('ECG ' + str(ecg_id) + ' not in ground-truth set')
-    #     fqrs = fqrs_gt.iloc[:, 3:15].values[0]
-    #     rsr = fqrs_gt.iloc[:, 15:27].values[0]
-    #     jwave = fqrs_gt.iloc[:, 27:].values[0]
-    #     has_fqrs = False
-    #     has_rsr = False
-    #     has_j = False
-    #     if sum(fqrs) > 0:
-    #         has_fqrs = True
-    #     if sum(rsr) > 0:
-    #         has_rsr = True
-    #     if sum(jwave) > 0:
-    #         has_j = True
-    #
-    #     return [has_fqrs, has_rsr, has_j]
+    @staticmethod
+    def _correct_annotations(ann_list):
+        result = []
+        for lead_ann in ann_list:
+            if type(lead_ann) is not list:
+                lead_ann = [lead_ann]
+            lead_result = []
+            for ann in lead_ann:
+                if type(ann) is list:
+                    if len(ann) == 0:
+                        continue
+                    lead_result.append([ann[0] - 1, ann[1] - 1])
+                else:
+                    lead_result.append(ann-1)
+            result.append(lead_result)
+        return result
 
 
 class SignalProcessing:

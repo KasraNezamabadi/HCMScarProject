@@ -1,14 +1,22 @@
+import os.path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from Utility import Loader, Util, NoOffsetException
+import GlobalPaths
 
 
 class QTSegmentExtractor:
+    def __init__(self, ecg_dir_path: str, ann_dir_path: str, metadata_path: str, verbose: bool = True):
+        self.ecg_dir_path = ecg_dir_path
+        self.ann_dir_path = ann_dir_path
+        self.metadata_path = metadata_path
 
-    def __init__(self, verbose: bool = True):
-        self.ecg_ids, self.pids, self.frequency_list = Loader.get_ecg_pid_pair_list()
+        self.ecg_ids, self.pids, self.frequency_list = Loader.metadata(metadata_path=metadata_path)
         self.column_names = ['P Start', 'P End', 'QRS Start', 'QRS End', 'T Start', 'T End']
+        # self.selected_leads = [1, 2, 5, 7]
+        self.selected_leads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         self.verbose = verbose
 
     def extract_segments(self):
@@ -18,6 +26,7 @@ class QTSegmentExtractor:
             pid = self.pids[i]
             frequency = self.frequency_list[i]
             segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
+
             if pid in segment_dict:
                 p_results_dict = segment_dict[pid]
                 results[pid] = p_results_dict
@@ -28,29 +37,31 @@ class QTSegmentExtractor:
 
         return results
 
-    def extract_qrs(self):
-        results = {}
-        for i in range(len(self.ecg_ids)):
-            ecg_id = self.ecg_ids[i]
-            pid = self.pids[i]
-            frequency = self.frequency_list[i]
-            segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
-            if pid in segment_dict:
-                p_results_dict = segment_dict[pid]
-                results[pid] = p_results_dict
-            else:
-                print(f'Skipping {pid}')
-            if self.verbose and i != 0 and i % 50 == 0:
-                print(f'--- {round(i/len(self.ecg_ids) * 100)}% Done')
-
-        return results
+    # def extract_qrs(self):
+    #     results = {}
+    #     for i in range(len(self.ecg_ids)):
+    #         ecg_id = self.ecg_ids[i]
+    #         pid = self.pids[i]
+    #         frequency = self.frequency_list[i]
+    #         segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
+    #         if pid in segment_dict:
+    #             p_results_dict = segment_dict[pid]
+    #             results[pid] = p_results_dict
+    #         else:
+    #             print(f'Skipping {pid}')
+    #         if self.verbose and i != 0 and i % 50 == 0:
+    #             print(f'--- {round(i/len(self.ecg_ids) * 100)}% Done')
+    #
+    #     return results
 
     def _parse_annotation(self, ecg_id: int, pid: int, frequency: int):
         results = {}
-        ecg = Loader.fast_get_ecg(ecg_id=ecg_id, frequency=frequency)
-        # print(f'Extracting segments from PID = {pid}')
-
-        ann = Loader.get_annotations(ecg_id=ecg_id)
+        ecg = Loader.ecg(path=os.path.join(self.ecg_dir_path, str(ecg_id) + '.csv'), frequency=frequency)
+        try:
+            ann = Loader.pla_annotation(ann_folder_path=self.ann_dir_path, ecg_id=ecg_id)
+        except FileNotFoundError:
+            # print('No annotation found for ECG = ' + str(ecg_id))
+            return {}
 
         for index, row in ann.iterrows():
             lead_ecg = ecg[Util.get_lead_name(index=index)].values
@@ -84,10 +95,9 @@ class QTSegmentExtractor:
         hb_interval = round(sum_hb_intervals/count_hb)
 
         count_qt = 0
-        all_lead_results = {}
         all_lead_bounds = []
-        selected_leads = [1, 2, 5, 7]
-        for lead in selected_leads:
+
+        for lead in self.selected_leads:
             qt_segments = []
             qt_bounds = []
 
@@ -108,12 +118,14 @@ class QTSegmentExtractor:
                     v = 9
                     pass
             all_lead_bounds.append(qt_bounds)
-        outlier_bounds = {'II': [], 'III': [], 'aVF': [], 'V2': []}
+        outlier_bounds = {'I': [], 'II': [], 'III': [],
+                          'aVR': [], 'aVL': [], 'aVF': [],
+                          'V1': [], 'V2': [], 'V3': [], 'V4': [], 'V5': [], 'V6': []}
         is_not_equal, min_hb, min_hb_index = self._hb_not_equal(all_lead_bounds)
         if is_not_equal:
-            for lead_index in range(len(selected_leads)):
+            for lead_index in range(len(self.selected_leads)):
                 for bound in all_lead_bounds[lead_index]:
-                    for second_lead_index in range(len(selected_leads)):
+                    for second_lead_index in range(len(self.selected_leads)):
                         if second_lead_index != lead_index:
                             # Find the closest onset/offset in the other lead
                             max_dist_onset = 10000
@@ -132,7 +144,7 @@ class QTSegmentExtractor:
                             offset_diff = abs(closest_bound[1] - bound[1])
                             # If the closest onset/offset in other lead is beyond threshold, bound is outlier
                             if (onset_diff > round(0.3 * frequency) or offset_diff > round(0.3 * frequency)) and abs(bound[1] - bound[0]) > round(0.1 * frequency):
-                                lead_name = Util.get_lead_name(selected_leads[lead_index])
+                                lead_name = Util.get_lead_name(self.selected_leads[lead_index])
                                 interval_already_exists = False
                                 for out_lead_name, outlier_list in outlier_bounds.items():
                                     for y in outlier_list:
@@ -148,7 +160,7 @@ class QTSegmentExtractor:
             bounds_selected = []
             for bound in all_lead_bounds[lead_index]:
                 closest_bounds = [bound]
-                for second_lead_index in range(len(selected_leads)):
+                for second_lead_index in range(len(self.selected_leads)):
                     if second_lead_index != lead_index:
                         # Find the closest onset/offset in the other lead
                         max_dist_onset = 10000
@@ -194,7 +206,7 @@ class QTSegmentExtractor:
             bounds_selected = []
             for bound in all_lead_bounds[min_hb_index]:
                 closest_bounds = [bound]
-                for second_lead_index in range(len(selected_leads)):
+                for second_lead_index in range(len(self.selected_leads)):
                     if second_lead_index != min_hb_index:
                         # Find the closest onset/offset in the other lead
                         max_dist_onset = 10000
@@ -228,15 +240,6 @@ class QTSegmentExtractor:
                 interval = offset - onset
                 if interval <= round(0.9 * hb_interval):
                     bounds_selected.append([onset, offset])
-                    # qt_segments = []
-                    # for lead_id in selected_leads:
-                    #     lead_qt_segment = np.array(ecg.iloc[onset:offset + 1, lead_id].values)
-                    #     qt_segments.append(lead_qt_segment)
-                    # qt_segments = np.array(qt_segments)
-                    # if pid in results:
-                    #     results[pid].append(qt_segments)
-                    # else:
-                    #     results[pid] = [qt_segments]
 
             selected_outlier_bound_list = []
             for outlier_bound_list in outlier_bounds.values():
@@ -295,7 +298,7 @@ class QTSegmentExtractor:
                     onset = bound[0]
                     offset = bound[1]
                     qt_segments = []
-                    for lead_id in selected_leads:
+                    for lead_id in self.selected_leads:
                         lead_qt_segment = np.array(ecg.iloc[onset:offset + 1, lead_id].values)
                         qt_segments.append(lead_qt_segment)
                     qt_segments = np.array(qt_segments)
