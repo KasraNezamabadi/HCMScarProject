@@ -1,3 +1,4 @@
+import random
 import statistics
 
 import numpy as np
@@ -13,7 +14,7 @@ from Utility import Util
 from sklearn.metrics import classification_report
 
 notch_prom_threshold = 0.1
-wave_prom_threshold = 0.1
+wave_prom_threshold = 0.05
 
 
 class Wave:
@@ -34,7 +35,7 @@ class QRSComplex:
         for wave_name in self.interpret:
             self.get_wave(name=wave_name)
 
-    def get_wave(self, name: str):  # Returns None if the wave does not exist.
+    def get_wave(self, name: str):  # Returns None or [] if the wave does not exist.
         if name == 'notches':
             notches = []
             for notch in self.interpret[name]:
@@ -42,6 +43,24 @@ class QRSComplex:
                                     prominence=notch.prominence,
                                     width=notch.width,
                                     amp=self.segment_raw[notch.peak_index]))
+            return notches
+        elif name == 'terminal_notches':
+            notches = []
+            for notch in self.interpret['notches']:
+                if notch.peak_index > round(0.6 * len(self.segment_norm)):
+                    notches.append(Wave(peak_index=notch.peak_index,
+                                        prominence=notch.prominence,
+                                        width=notch.width,
+                                        amp=self.segment_raw[notch.peak_index]))
+            return notches
+        elif name == 'non_terminal_notches':
+            notches = []
+            for notch in self.interpret['notches']:
+                if notch.peak_index < round(0.6 * len(self.segment_norm)):
+                    notches.append(Wave(peak_index=notch.peak_index,
+                                        prominence=notch.prominence,
+                                        width=notch.width,
+                                        amp=self.segment_raw[notch.peak_index]))
             return notches
         else:
             peak_index = self.interpret[name]
@@ -209,10 +228,10 @@ def identify_qs(segment_norm: [float], r_index: int, base_amp: float):
                 right_max_distance = r_dist
                 candidate_s_wave = wave
 
-    if candidate_q_wave is not None and segment_norm[candidate_q_wave.peak_index] < base_amp:
+    if candidate_q_wave is not None and segment_norm[candidate_q_wave.peak_index] < min(base_amp, 0):
         result['Q'] = candidate_q_wave.peak_index
 
-    if candidate_s_wave is not None and segment_norm[candidate_s_wave.peak_index] < base_amp:
+    if candidate_s_wave is not None and segment_norm[candidate_s_wave.peak_index] < min(base_amp, 0):
         result['S'] = candidate_s_wave.peak_index
 
     # plt.plot(segment_norm)
@@ -233,25 +252,38 @@ def get_wave(signal_norm: [float], peak_index: int):
     return Wave(peak_index=peak_index, prominence=prominence, width=width)
 
 
+def find_wave_with_max_prominence(segment_orig: [float], segment_norm: [float]):
+    peak_indexes, _ = signal.find_peaks(x=segment_norm)
+    peak_prominences = signal.peak_prominences(x=segment_norm, peaks=peak_indexes)[0]
+    peak_widths = signal.peak_widths(x=segment_norm, peaks=peak_indexes, rel_height=1)[0]
+
+    segment_inverted = [-1 * x for x in segment_norm]
+    valley_indexes, _ = signal.find_peaks(x=segment_inverted)
+    valley_prominences = signal.peak_prominences(x=segment_inverted, peaks=valley_indexes)[0]
+    valley_widths = signal.peak_widths(x=segment_inverted, peaks=valley_indexes)[0]
+
+    extrema_idx = np.concatenate((peak_indexes, valley_indexes))
+    extrema_prominences = np.concatenate((peak_prominences, valley_prominences))
+    extrema_widths = np.concatenate((peak_widths, valley_widths))
+
+    extremum_idx_with_max_prom = max(zip(extrema_idx, extrema_prominences, extrema_widths), key=lambda x: x[1])
+
+    return Wave(peak_index=extremum_idx_with_max_prom[0],
+                prominence=extremum_idx_with_max_prom[1],
+                width=extremum_idx_with_max_prom[2],
+                amp=segment_orig[extremum_idx_with_max_prom[0]])
+
+
 def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
     t_waves = []  # Single T-wave or biphasic T-wave.
-    extrema = []
-    peak_indexes, _ = signal.find_peaks(x=t_segment_orig)
-    valley_indexes, _ = signal.find_peaks(x=[-1 * x for x in t_segment_orig])
-    extrema.extend(peak_indexes)
-    extrema.extend(valley_indexes)
-    extrema_abs_amps = [abs(t_segment_orig[x]) for x in extrema]
-    gmax_index = max(zip(extrema, extrema_abs_amps), key=lambda x: x[1])[0]
-    # gmax_index = get_global_peak(t_segment_orig)
-
-    if t_segment_orig[gmax_index] < 0:  # T-wave is negative.
-        t_segment_norm = [-1 * x for x in t_segment_norm]
-
-    t_wave = get_wave(signal_norm=t_segment_norm, peak_index=gmax_index)
-    t_wave.amp = t_segment_orig[t_wave.peak_index]
+    t_wave = find_wave_with_max_prominence(segment_orig=t_segment_orig, segment_norm=t_segment_norm)
     t_waves.append(t_wave)
 
-    inverted_t_segment = [-1 * x for x in t_segment_norm]
+    if t_wave.amp > 0:
+        inverted_t_segment = [-1 * x for x in t_segment_norm]
+    else:
+        inverted_t_segment = t_segment_norm
+
     valley_indexes, _ = signal.find_peaks(x=inverted_t_segment)
     valley_prominences = signal.peak_prominences(x=inverted_t_segment, peaks=valley_indexes)[0]
     valley_widths = signal.peak_widths(x=inverted_t_segment, peaks=valley_indexes, rel_height=1)[0]
@@ -372,17 +404,7 @@ def identify_qrs_waves(qrs_segment_orig: [float], qrs_segment_norm: [float]):
         if interpret_result['S'] == -1:
             interpret_result['S'] = qs_dict['S']
 
-    # Step 4: Get rid of notches in the terminal portion of the QRS complex.
-    all_notches = interpret_result['notches']
-    terminal_notches = []
-    non_terminal_notches = []
-    for notch in all_notches:
-        if notch.peak_index < round(0.5 * len(qrs_segment_orig)):
-            non_terminal_notches.append(notch)
-        else:
-            terminal_notches.append(notch)
-    qrs = QRSComplex(segment_raw=qrs_segment_orig, segment_norm=qrs_segment_norm, interpret=interpret_result, base_amp=qrs_base_amp)
-    return qrs, non_terminal_notches, terminal_notches
+    return QRSComplex(segment_raw=qrs_segment_orig, segment_norm=qrs_segment_norm, interpret=interpret_result, base_amp=qrs_base_amp)
 
 
 def process_website_ecgs():
@@ -544,6 +566,167 @@ def process_t_waves():
                 v = 9
 
 
+def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
+    ecg_id = extracted_segments_dict[pid]['ecg_id']
+    frequency = extracted_segments_dict[pid]['frequency']
+    lead_name = Util.get_lead_name(index=lead_index)
+    lead_qt_segments = [x[lead_index, :] for x in extracted_segments_dict[pid]['segments']]
+    # Buffer vars for feature extraction from lead.
+    lead_qrs_list = []
+    lead_t_list = []
+    lead_qrs_segment_norm = []
+    lead_t_segment_norm = []
+    if ecg_id == 2054 and lead_name == 'V5':
+        v = 9
+    for qt_segment in lead_qt_segments:
+        qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
+        t_segment = qt_segment[round(len(qt_segment) / 3):]
+
+        # Normalize segments.
+        qt_segment_norm = normalize(segment=qt_segment)
+        qrs_segment_norm = qt_segment_norm[:round(len(qt_segment) / 3)]
+        t_segment_norm = qt_segment_norm[round(len(qt_segment) / 3):]
+
+        # Sometimes the QRS segment is incorrectly identified: monotonically increasing or decreasing. Skip.
+        if (qrs_segment[0] == min(qrs_segment) and qrs_segment[-1] == max(qrs_segment)) or \
+                qrs_segment[-1] == min(qrs_segment) and qrs_segment[0] == max(qrs_segment):
+            continue
+
+        try:
+            qrs = identify_qrs_waves(qrs_segment_orig=qrs_segment, qrs_segment_norm=qrs_segment_norm)
+        except AssertionError:
+            continue
+
+        # plt.plot(t_segment_norm)
+        # plt.show()
+        t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
+
+
+        lead_qrs_list.append(qrs)
+        lead_t_list.append(t_waves)
+        lead_t_segment_norm.append(t_segment_norm)
+        lead_qrs_segment_norm.append(qrs_segment_norm)
+
+    lead_feature_vector = {'Q': 0, 'R': 0, 'S': 0,
+                           'terminal_notches': 0, 'non_terminal_notches': 0, 'cross_baseline': False,
+                           'max_prominence': 0,
+                           'T': 0, 'T2': False, 't_prominence': 0, 't_width': 0}
+
+    # Step 1: Extract Q, R, and S amps.
+    q_list = []
+    r_list = []
+    s_list = []
+    qrs_prominence = 0
+    for qrs in lead_qrs_list:
+        q = qrs.get_wave(name='Q')
+        r = qrs.get_wave(name='R')
+        s = qrs.get_wave(name='S')
+        if q is not None:
+            q_list.append(q)
+            if q.prominence > qrs_prominence:
+                qrs_prominence = q.prominence
+        if r is not None:
+            r_list.append(r)
+            if r.prominence > qrs_prominence:
+                qrs_prominence = r.prominence
+        if s is not None:
+            s_list.append(s)
+            if s.prominence > qrs_prominence:
+                qrs_prominence = s.prominence
+
+    lead_feature_vector['QRS_prominence'] = qrs_prominence
+    if len(q_list) > 1:
+        lead_feature_vector['Q'] = statistics.mean([x.amp for x in q_list])
+    elif len(q_list) == 1:
+        lead_feature_vector['Q'] = q_list[0].amp
+
+    if len(r_list) > 1:
+        lead_feature_vector['R'] = statistics.mean([x.amp for x in r_list])
+    elif len(r_list) == 1:
+        lead_feature_vector['R'] = r_list[0].amp
+
+    if len(s_list) > 1:
+        lead_feature_vector['S'] = statistics.mean([x.amp for x in s_list])
+    elif len(s_list) == 1:
+        lead_feature_vector['S'] = s_list[0].amp
+
+    # Step 2: Handle notches.
+    lead_feature_vector['terminal_notches'] = max(
+        [len(qrs_notches) for qrs_notches in [qrs.get_wave(name='terminal_notches') for qrs in lead_qrs_list]])
+    lead_feature_vector['non_terminal_notches'] = max(
+        [len(qrs_notches) for qrs_notches in [qrs.get_wave(name='non_terminal_notches') for qrs in lead_qrs_list]])
+
+    non_terminal_prominence = 0
+    for qrs_notches in [qrs.get_wave(name='non_terminal_notches') for qrs in lead_qrs_list]:
+        if len(qrs_notches) > 0:
+            temp_max_prominence = max([notch.prominence for notch in qrs_notches])
+            if temp_max_prominence > non_terminal_prominence:
+                non_terminal_prominence = temp_max_prominence
+    lead_feature_vector['non_terminal_prominence'] = non_terminal_prominence
+
+    terminal_prominence = 0
+    for qrs_notches in [qrs.get_wave(name='terminal_notches') for qrs in lead_qrs_list]:
+        if len(qrs_notches) > 0:
+            temp_max_prominence = max([notch.prominence for notch in qrs_notches])
+            if temp_max_prominence > terminal_prominence:
+                terminal_prominence = temp_max_prominence
+    lead_feature_vector['terminal_prominence'] = terminal_prominence
+
+    terminal_notch_cross_list = []
+    non_terminal_notch_cross_list = []
+    for i in range(len(lead_qrs_list)):
+        qrs = lead_qrs_list[i]
+        qrs_base_amp = qrs.base_amp
+        qrs_segment = lead_qrs_segment_norm[i]
+
+        terminal_notches = qrs.get_wave(name='terminal_notches')
+        non_terminal_notches = qrs.get_wave(name='non_terminal_notches')
+        terminal_has_crossed = False
+        non_terminal_has_crossed = False
+        for notch in terminal_notches:
+            if cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index):
+                terminal_has_crossed = True
+                break
+        terminal_notch_cross_list.append(terminal_has_crossed)
+        for notch in non_terminal_notches:
+            if cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index):
+                non_terminal_has_crossed = True
+                break
+        non_terminal_notch_cross_list.append(non_terminal_has_crossed)
+
+    lead_feature_vector['terminal_has_crossed'] = any(terminal_notch_cross_list)
+    lead_feature_vector['non_terminal_has_crossed'] = any(non_terminal_notch_cross_list)
+
+    # Step 3: Handle T-wave.
+    # TODO: A wave's width must be proportional to its sampling frequency.
+    # TODO: Slope of the line intercepting QRS_end and left leg of T-wave.
+    lead_feature_vector['T'] = statistics.mean([t_waves[0].amp for t_waves in lead_t_list])
+    lead_feature_vector['t_prominence'] = statistics.mean([t_waves[0].prominence for t_waves in lead_t_list])
+    lead_feature_vector['t_width'] = statistics.mean([t_waves[0].width for t_waves in lead_t_list])
+    lead_feature_vector['T2'] = any([True if len(t_waves) > 1 else False for t_waves in lead_t_list])
+
+    for key in lead_feature_vector:
+        if isinstance(lead_feature_vector[key], float):
+            if abs(lead_feature_vector[key]) > 1:
+                lead_feature_vector[key] = round(lead_feature_vector[key], 1)
+            else:
+                lead_feature_vector[key] = round(lead_feature_vector[key], 3)
+
+    lead_signal = extracted_segments_dict[pid]['ecg_denoised'][lead_name].values
+    plt.figure(figsize=(30, 12))
+    plt.plot(lead_signal)
+    title = f"{pid} - {ecg_id} - {lead_name}\n " \
+            f"Q={lead_feature_vector['Q']}   R={lead_feature_vector['R']}    S={lead_feature_vector['S']}\n" \
+            f"Non-TerminalNotchCount={lead_feature_vector['non_terminal_notches']}   TerminalNotchCount={lead_feature_vector['terminal_notches']}\n" \
+            f"QRSProm={lead_feature_vector['QRS_prominence']}    Non-TerminalProm={lead_feature_vector['non_terminal_prominence']}   TerminalProm={lead_feature_vector['terminal_prominence']}\n" \
+            f"Non-TerminalHasCrossed?={lead_feature_vector['non_terminal_has_crossed']}  TerminalHasCrossed?={lead_feature_vector['terminal_has_crossed']}\n" \
+            f"T={lead_feature_vector['T']}   T2={lead_feature_vector['T2']}  T_Prom={lead_feature_vector['t_prominence']}    T_width={lead_feature_vector['t_width']}"
+    plt.title(title, fontsize=14)
+    plt.show()
+    v = 9
+    return lead_feature_vector
+
+
 def process_for_ml():
     extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.website_ecg,
                                    ann_dir_path=GlobalPaths.website_pla_annotation,
@@ -551,111 +734,18 @@ def process_for_ml():
                                    verbose=True)
     extracted_segments_dict = extractor.extract_segments()
     pids = list(extracted_segments_dict.keys())
-    for pid in pids:
-        ecg_id = extracted_segments_dict[pid]['ecg_id']
-        for lead_index in range(12):
-            lead_name = Util.get_lead_name(index=lead_index)
-            lead_qt_segments = [x[lead_index, :] for x in extracted_segments_dict[pid]['segments']]
-            # Buffer vars for feature extraction from lead.
-            lead_qrs_list = []
-            lead_t_list = []
-            lead_qrs_segment_norm = []
-            lead_t_segment_norm = []
-            for qt_segment in lead_qt_segments:
-                qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
-                t_segment = qt_segment[round(len(qt_segment) / 3):]
-                # Normalize segments.
-                qt_segment_norm = normalize(segment=qt_segment)
-                qrs_segment_norm = qt_segment_norm[:round(len(qt_segment) / 3)]
-                t_segment_norm = qt_segment_norm[round(len(qt_segment) / 3):]
 
-                # Sometimes the QRS segment is incorrectly identified: monotonically increasing or decreasing. Skip.
-                if (qrs_segment[0] == min(qrs_segment) and qrs_segment[-1] == max(qrs_segment)) or \
-                        qrs_segment[-1] == min(qrs_segment) and qrs_segment[0] == max(qrs_segment):
-                    continue
+    # f = extract_features(extracted_segments_dict, pid=10158, lead_index=3)
 
-                try:
-                    qrs, _, _ = identify_qrs_waves(qrs_segment_orig=qrs_segment,
-                                                   qrs_segment_norm=qrs_segment_norm)
-                except AssertionError:
-                    continue
+    for _ in range(20):
+        pid = random.choice(pids)
+        lead_index = random.choice(range(12))
+        print(f'PID = {pid}, Lead = {lead_index}')
+        f = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
 
-                t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
-                lead_qrs_list.append(qrs)
-                lead_t_list.append(t_waves)
-                lead_t_segment_norm.append(t_segment_norm)
-                lead_qrs_segment_norm.append(qrs_segment_norm)
-
-            lead_feature_vector = {'Q': 0, 'R': 0, 'S': 0,
-                                   'max_#_notches': 0, 'cross_baseline': False, 'max_prominence': 0,
-                                   'T': 0, 'T2': False, 't_prominence': 0, 't_width': 0}
-
-            # Step 1: Extract Q, R, and S amps.
-            q_list = []
-            r_list = []
-            s_list = []
-            for qrs in lead_qrs_list:
-                q = qrs.get_wave(name='Q')
-                r = qrs.get_wave(name='R')
-                s = qrs.get_wave(name='S')
-                if q is not None:
-                    q_list.append(q)
-                if r is not None:
-                    r_list.append(r)
-                if s is not None:
-                    s_list.append(s)
-            if len(q_list) > 1:
-                lead_feature_vector['Q'] = statistics.mean([x.amp for x in q_list])
-            elif len(q_list) == 1:
-                lead_feature_vector['Q'] = q_list[0].amp
-
-            if len(r_list) > 1:
-                lead_feature_vector['R'] = statistics.mean([x.amp for x in r_list])
-            elif len(r_list) == 1:
-                lead_feature_vector['R'] = r_list[0].amp
-
-            if len(s_list) > 1:
-                lead_feature_vector['S'] = statistics.mean([x.amp for x in s_list])
-            elif len(s_list) == 1:
-                lead_feature_vector['S'] = s_list[0].amp
-
-            # Step 2: Handle notches.
-            notch_list = [qrs.get_wave(name='notches') for qrs in lead_qrs_list]
-            lead_feature_vector['max_#_notches'] = max([len(notch_set) for notch_set in notch_list])
-            if lead_feature_vector['max_#_notches'] > 0:
-                lead_feature_vector['max_prominence'] = max([max([notch.prominence for notch in notch_set if len(notch_set) > 0]) for notch_set in notch_list if len(notch_set) > 0])
-
-            notch_cross_list = []
-            for i in range(len(lead_qrs_list)):
-                qrs = lead_qrs_list[i]
-                qrs_segment = lead_qrs_segment_norm[i]
-                qrs_base_amp = qrs.base_amp
-                notches = qrs.get_wave(name='notches')
-                has_crossed = False
-                for notch in notches:
-                    if cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index):
-                        has_crossed = True
-                        break
-                notch_cross_list.append(has_crossed)
-            lead_feature_vector['cross_baseline'] = any(notch_cross_list)
-
-            # Step 3: Handle T-wave.
-            # TODO: A wave's width must be proportional to its sampling frequency.
-            lead_feature_vector['T1'] = statistics.mean([t_waves[0].amp for t_waves in lead_t_list])
-            lead_feature_vector['t_prominence'] = statistics.mean([t_waves[0].prominence for t_waves in lead_t_list])
-            lead_feature_vector['t_width'] = statistics.mean([t_waves[0].width for t_waves in lead_t_list])
-            lead_feature_vector['T2'] = any([True if len(t_waves) > 1 else False for t_waves in lead_t_list])
-
-            for key in lead_feature_vector:
-                if isinstance(lead_feature_vector[key], float):
-                    lead_feature_vector[key] = round(lead_feature_vector[key], 2)
-
-            lead_signal = extracted_segments_dict[pid]['ecg_denoised'][lead_name].values
-            plt.figure(figsize=(15, 5))
-            plt.plot(lead_signal)
-            plt.title(f'{pid}-{ecg_id}-{lead_name}\n{lead_feature_vector}', fontsize=10)
-            plt.show()
-            v = 9
+    # for pid in pids:
+    #     for lead_index in range(12):
+    #         f = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
 
 
 if __name__ == '__main__':
