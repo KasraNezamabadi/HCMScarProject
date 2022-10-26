@@ -240,19 +240,19 @@ def identify_qs(segment_norm: [float], r_index: int, base_amp: float):
     return result
 
 
-def get_wave(signal_norm: [float], peak_index: int):
-    prominence = signal.peak_prominences(x=signal_norm, peaks=[peak_index])[0][0]
-    if prominence == 0:
-        plt.plot(signal_norm)
-        plt.scatter(x=peak_index, y=signal_norm[peak_index], color='r')
-        plt.show()
-        raise AssertionError(f'Requested peak at index {peak_index} is not a local minimum/maximum'
-                             f' (prominence = {prominence})')
-    width = signal.peak_widths(x=signal_norm, peaks=[peak_index], rel_height=1)[0][0]
-    return Wave(peak_index=peak_index, prominence=prominence, width=width)
+# def get_wave(signal_norm: [float], peak_index: int):
+#     prominence = signal.peak_prominences(x=signal_norm, peaks=[peak_index])[0][0]
+#     if prominence == 0:
+#         plt.plot(signal_norm)
+#         plt.scatter(x=peak_index, y=signal_norm[peak_index], color='r')
+#         plt.show()
+#         raise AssertionError(f'Requested peak at index {peak_index} is not a local minimum/maximum'
+#                              f' (prominence = {prominence})')
+#     width = signal.peak_widths(x=signal_norm, peaks=[peak_index], rel_height=1)[0][0]
+#     return Wave(peak_index=peak_index, prominence=prominence, width=width)
 
 
-def find_wave_with_max_prominence(segment_orig: [float], segment_norm: [float]):
+def find_global_extremum(segment_orig: [float], segment_norm: [float]):
     peak_indexes, _ = signal.find_peaks(x=segment_norm)
     peak_prominences = signal.peak_prominences(x=segment_norm, peaks=peak_indexes)[0]
     peak_widths = signal.peak_widths(x=segment_norm, peaks=peak_indexes, rel_height=1)[0]
@@ -276,7 +276,7 @@ def find_wave_with_max_prominence(segment_orig: [float], segment_norm: [float]):
 
 def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
     t_waves = []  # Single T-wave or biphasic T-wave.
-    t_wave = find_wave_with_max_prominence(segment_orig=t_segment_orig, segment_norm=t_segment_norm)
+    t_wave = find_global_extremum(segment_orig=t_segment_orig, segment_norm=t_segment_norm)
     t_waves.append(t_wave)
 
     if t_wave.amp > 0:
@@ -418,6 +418,7 @@ def process_website_ecgs():
 
     report_fp = []
     report_fn = []
+    report_per_pid = {}
     for lead_index in range(12):  # Identify fQRS and evaluate per lead.
         lead_name = Util.get_lead_name(index=lead_index)
         result_auto = []
@@ -488,32 +489,33 @@ def process_website_ecgs():
                 else:
                     fqrs_lead.append(1)
 
-            if ecg_id == 712 and lead_name == 'I':
-                v = 9
-
             if sum(fqrs_lead) > 0:
                 result_auto.append(1)
+                if pid in report_per_pid:
+                    report_per_pid[pid].append(lead_name)
+                else:
+                    report_per_pid[pid] = [lead_name]
             else:
                 result_auto.append(0)
 
             has_fqrs = get_gt_ann(gt_ann, pid=pid, lead_name=lead_name)
             result_gt.append(has_fqrs)
 
-            # Visualize FP/FN detection.
+            # Visualize FP/FN detection and save the errors for reporting.
             if (sum(fqrs_lead) > 0 and has_fqrs == 0) or (sum(fqrs_lead) == 0 and has_fqrs == 1):
-                fig, axes = plt.subplots(nrows=1, ncols=len(qrs_object_list), figsize=(10, 4))
-                for j in range(len(qrs_object_list)):
-                    plot_qrs_waves(qrs_object_list[j], ax=axes, i=j)
-                for ax in axes:
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                error_type = 'FP'
-                if sum(fqrs_lead) == 0 and has_fqrs == 1:
-                    error_type = 'FN'
-                fig.suptitle(f'{error_type} Detection: PID={pid} ECG={ecg_id}-{lead_name}', fontsize=16)
-                fig_name = f'Data/fQRSImages/{error_type}_{ecg_id}_{lead_name}.png'
-                plt.savefig(fig_name)
-                plt.show()
+                # fig, axes = plt.subplots(nrows=1, ncols=len(qrs_object_list), figsize=(10, 4))
+                # for j in range(len(qrs_object_list)):
+                #     plot_qrs_waves(qrs_object_list[j], ax=axes, i=j)
+                # for ax in axes:
+                #     ax.set_xticks([])
+                #     ax.set_yticks([])
+                # error_type = 'FP'
+                # if sum(fqrs_lead) == 0 and has_fqrs == 1:
+                #     error_type = 'FN'
+                # fig.suptitle(f'{error_type} Detection: PID={pid} ECG={ecg_id}-{lead_name}', fontsize=16)
+                # fig_name = f'Data/fQRSImages/{error_type}_{ecg_id}_{lead_name}.png'
+                # plt.savefig(fig_name)
+                # plt.show()
                 row = [pid, ecg_id, lead_name]
                 if sum(fqrs_lead) > 0 and has_fqrs == 0:
                     report_fp.append(row)
@@ -523,9 +525,20 @@ def process_website_ecgs():
         print(f'\n--- Lead {lead_name} ---:')
         print(classification_report(result_gt, result_auto, target_names=['Non-fQRS', 'fQRS']))
         v = 0
-    cols = ['Record_ID', 'ECG_ID', 'Lead']
-    df_fp = pd.DataFrame(report_fp, columns=cols)
-    df_fn = pd.DataFrame(report_fn, columns=cols)
+    final_report_fp = []
+    final_report_fn = []
+    for row in report_fp:
+        row.append(report_per_pid[row[0]])
+        final_report_fp.append(row)
+    for row in report_fn:
+        if row[0] in report_per_pid:
+            row.append(report_per_pid[row[0]])
+        else:
+            row.append([])
+        final_report_fn.append(row)
+    cols = ['Record_ID', 'ECG_ID', 'Disagreed Lead', 'All fQRS leads identified by method']
+    df_fp = pd.DataFrame(final_report_fp, columns=cols)
+    df_fn = pd.DataFrame(final_report_fn, columns=cols)
     df_fp.to_csv('Data/fQRS_FP.csv', index=False)
     df_fn.to_csv('Data/fQRS_FN.csv', index=False)
     print('Reports Saved!')
@@ -749,9 +762,9 @@ def process_for_ml():
 
 
 if __name__ == '__main__':
-    # process_website_ecgs()
+    process_website_ecgs()
     # process_t_waves()
-    process_for_ml()
+    # process_for_ml()
 
 
 
