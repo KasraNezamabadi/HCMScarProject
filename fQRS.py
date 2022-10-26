@@ -6,12 +6,13 @@ import pandas as pd
 from scipy import signal
 from random import shuffle
 from random import choice
-from tslearn.preprocessing import TimeSeriesScalerMinMax
+from tslearn.preprocessing import TimeSeriesScalerMinMax, TimeSeriesScalerMeanVariance
 import matplotlib.pyplot as plt
 from QTSegmentExtractor import QTSegmentExtractor
 import GlobalPaths
-from Utility import Util
+from Utility import Util, SignalProcessing
 from sklearn.metrics import classification_report
+from scipy.stats import linregress
 
 notch_prom_threshold = 0.1
 wave_prom_threshold = 0.05
@@ -276,6 +277,14 @@ def find_global_extremum(segment_orig: [float], segment_norm: [float]):
 
 def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
     t_waves = []  # Single T-wave or biphasic T-wave.
+
+    smooth_w_len = round(len(t_segment_norm)/10)
+    t_segment_norm_smooth = SignalProcessing.smooth(x=t_segment_norm, window_len=smooth_w_len, window='flat')
+    t_segment_orig_smooth = SignalProcessing.smooth(x=t_segment_orig, window_len=smooth_w_len, window='flat')
+
+    t_segment_norm = t_segment_norm_smooth[round(smooth_w_len / 2) - 1: len(t_segment_norm_smooth) - round(smooth_w_len / 2)]
+    t_segment_orig = t_segment_orig_smooth[round(smooth_w_len / 2) - 1: len(t_segment_orig_smooth) - round(smooth_w_len / 2)]
+
     t_wave = find_global_extremum(segment_orig=t_segment_orig, segment_norm=t_segment_norm)
     t_waves.append(t_wave)
 
@@ -294,7 +303,31 @@ def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
             t2_wave = Wave(peak_index=valley_max[0], prominence=valley_max[1], width=valley_max[2],
                            amp=t_segment_orig[valley_max[0]])
             t_waves.append(t2_wave)
-    return t_waves
+
+    left_most_t_peak = t_waves[0].peak_index
+    if len(t_waves) > 1 and t_waves[1].peak_index < left_most_t_peak:
+        left_most_t_peak = t_waves[1].peak_index
+
+    p_start = np.asarray((0, t_segment_norm[0]))
+    p_end = np.asarray((left_most_t_peak, t_segment_norm[left_most_t_peak]))
+
+    max_dist = 0
+    t_onset = -1
+    for i in range(1, left_most_t_peak):
+        point = np.asarray((i, t_segment_norm[i]))
+        distance = np.linalg.norm(np.cross(p_end - p_start, p_start - point)) / np.linalg.norm(p_end - p_start)
+        if distance > max_dist:
+            max_dist = distance
+            t_onset = i
+
+    x = np.array(list(range(t_onset)))
+    y = t_segment_norm[x]
+    st_line = linregress(x=x, y=y)
+    x = np.array(list(range(t_onset)))
+    # plt.plot(t_segment_orig)
+    # plt.plot(x, st_line.intercept + st_line.slope * x, 'r')
+    # plt.show()
+    return t_waves, st_line, t_onset
 
 
 def plot_qrs_waves(qrs: QRSComplex, ax, i: int):
@@ -525,6 +558,24 @@ def process_website_ecgs():
         print(f'\n--- Lead {lead_name} ---:')
         print(classification_report(result_gt, result_auto, target_names=['Non-fQRS', 'fQRS']))
         v = 0
+
+    cols = ['Record_ID', 'ECG_ID', 'Disagreed Lead']
+    df_fp = pd.DataFrame(report_fp, columns=cols)
+    df_fn = pd.DataFrame(report_fn, columns=cols)
+    report_fp = []
+    report_fn = []
+    for ecg_id in set(df_fp['ECG_ID'].values):
+        target_df = df_fp.loc[df_fp['ECG_ID'] == ecg_id]
+        disagreed_leads = list(target_df['Disagreed Lead'].values)
+        record_id = target_df['Record_ID'].values[0]
+        report_fp.append([record_id, ecg_id, disagreed_leads])
+
+    for ecg_id in set(df_fn['ECG_ID'].values):
+        target_df = df_fn.loc[df_fn['ECG_ID'] == ecg_id]
+        disagreed_leads = list(target_df['Disagreed Lead'].values)
+        record_id = target_df['Record_ID'].values[0]
+        report_fn.append([record_id, ecg_id, disagreed_leads])
+
     final_report_fp = []
     final_report_fn = []
     for row in report_fp:
@@ -536,7 +587,7 @@ def process_website_ecgs():
         else:
             row.append([])
         final_report_fn.append(row)
-    cols = ['Record_ID', 'ECG_ID', 'Disagreed Lead', 'All fQRS leads identified by method']
+    cols = ['Record_ID', 'ECG_ID', 'Disagreed Leads', 'All fQRS leads identified by method']
     df_fp = pd.DataFrame(final_report_fp, columns=cols)
     df_fn = pd.DataFrame(final_report_fn, columns=cols)
     df_fp.to_csv('Data/fQRS_FP.csv', index=False)
@@ -551,7 +602,7 @@ def process_t_waves():
                                    verbose=True)
     extracted_segments_dict = extractor.extract_segments()
     pids = list(extracted_segments_dict.keys())
-
+    t_segment_ratio = 3.5
     for lead_index in range(12):  # Identify fQRS and evaluate per lead.
         lead_name = Util.get_lead_name(index=lead_index)
         for pid in pids:
@@ -561,20 +612,32 @@ def process_t_waves():
             for qt_segment in qt_segments:
                 lead_qt_segment = qt_segment[lead_index]
                 # Assumption: The QRS complex occurs within the first one-third of the QT interval.
-                t_segment = lead_qt_segment[round(len(lead_qt_segment) / 3):]
+                t_segment = lead_qt_segment[round(len(lead_qt_segment) / t_segment_ratio):]
 
                 # Step 2: Normalize the QT segment (not just the QRS segment) into [-1, 1]. It is needed to maintain a
                 # fixed prominence threshold when identifying notches.
-                t_segment_norm = normalize(segment=lead_qt_segment)[round(len(lead_qt_segment) / 3):]
-                t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
-                plt.plot(normalize(segment=lead_qt_segment))
-                offset = round(len(lead_qt_segment) / 3)
+                t_segment_norm = normalize(segment=lead_qt_segment)[round(len(lead_qt_segment) / t_segment_ratio):]
+                t_waves, st_line, t_onset = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
+
+                lead_qt_segment = normalize(lead_qt_segment)
+                plt.plot(lead_qt_segment)
+                offset = round(len(lead_qt_segment) / t_segment_ratio)
                 x = t_waves[0].peak_index + offset
-                plt.scatter(x=x, y=normalize(segment=lead_qt_segment)[x], color='b')
+                plt.scatter(x=x, y=lead_qt_segment[x], color='b')
                 if len(t_waves) > 1:
                     x = t_waves[1].peak_index + offset
-                    plt.scatter(x=x, y=normalize(segment=lead_qt_segment)[x], color='y')
-                plt.title(f'{ecg_id}-{lead_name}: Prominence = {round(t_waves[0].prominence, 2)}, Width = {round(t_waves[0].width, 2)}')
+                    plt.scatter(x=x, y=lead_qt_segment[x], color='y')
+
+                x = np.array(list(range(t_onset)))
+                plt.plot(x + offset, st_line.intercept + st_line.slope * x, 'r')
+                t_onset = t_onset + offset
+                plt.scatter(x=t_onset, y=lead_qt_segment[t_onset], color='g')
+                plt.axvline(x=round(len(lead_qt_segment) / t_segment_ratio))
+                plt.title(f'{ecg_id}-{lead_name}: '
+                          f'Prominence = {round(t_waves[0].prominence, 2)} | '
+                          f' Width = {round(t_waves[0].width, 2)} | '
+                          f' Slope={round(st_line.slope, 3)} | '
+                          f'R={round(st_line.rvalue, 3)}')
                 plt.show()
                 v = 9
 
@@ -762,8 +825,8 @@ def process_for_ml():
 
 
 if __name__ == '__main__':
-    process_website_ecgs()
-    # process_t_waves()
+    # process_website_ecgs()
+    process_t_waves()
     # process_for_ml()
 
 
