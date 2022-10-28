@@ -80,7 +80,7 @@ class QRSComplex:
             return Wave(peak_index=peak_index, prominence=prominence, width=width, amp=amp)
 
 
-def cross_baseline(segment: [float], base_amp: float, peak_index: int) -> bool:
+def cross_baseline(segment: [float], base_amp: float, peak_index: int) -> (bool, int, int):
     left_leg_index = 0
     right_leg_index = len(segment) - 1
     prev_left_amp = segment[peak_index]
@@ -103,9 +103,9 @@ def cross_baseline(segment: [float], base_amp: float, peak_index: int) -> bool:
     left_amp = segment[left_leg_index]
     right_amp = segment[right_leg_index]
 
-    if peak_amp > base_amp and left_amp < base_amp and right_amp < base_amp:
-        return True
-    return False
+    if peak_amp > base_amp > left_amp and right_amp < base_amp:
+        return True, left_leg_index, right_leg_index
+    return False, left_leg_index, right_leg_index
 
 
 def get_global_peak(segment: [float]):
@@ -241,16 +241,42 @@ def identify_qs(segment_norm: [float], r_index: int, base_amp: float):
     return result
 
 
-# def get_wave(signal_norm: [float], peak_index: int):
-#     prominence = signal.peak_prominences(x=signal_norm, peaks=[peak_index])[0][0]
-#     if prominence == 0:
-#         plt.plot(signal_norm)
-#         plt.scatter(x=peak_index, y=signal_norm[peak_index], color='r')
-#         plt.show()
-#         raise AssertionError(f'Requested peak at index {peak_index} is not a local minimum/maximum'
-#                              f' (prominence = {prominence})')
-#     width = signal.peak_widths(x=signal_norm, peaks=[peak_index], rel_height=1)[0][0]
-#     return Wave(peak_index=peak_index, prominence=prominence, width=width)
+def identify_qrs_offset(qrs_segment_norm: [float], qrs: QRSComplex) -> int:
+    q = qrs.get_wave(name='Q')
+    r = qrs.get_wave(name='R')
+    s = qrs.get_wave(name='S')
+    notches = qrs.get_wave(name='notches')
+    last_peak_index = 0
+    if q is not None and q.peak_index > last_peak_index:
+        last_peak_index = q.peak_index
+    if r is not None and r.peak_index > last_peak_index:
+        last_peak_index = r.peak_index
+    if s is not None and s.peak_index > last_peak_index:
+        last_peak_index = s.peak_index
+    for notch in notches:
+        if notch.peak_index > last_peak_index:
+            last_peak_index = notch.peak_index
+
+    qrs_base_amp = statistics.mean([qrs_segment_norm[0], qrs_segment_norm[-1]])
+    base_deviation_threshold = abs(qrs_segment_norm[last_peak_index] - qrs_base_amp) / 2
+
+    if qrs_segment_norm[last_peak_index] < qrs_base_amp:
+        _, _, last_peak_index = cross_baseline(qrs_segment_norm, qrs_base_amp, last_peak_index)
+
+    qrs_offset = -1
+    max_dist = 0
+
+    p_start = np.asarray((last_peak_index, qrs_segment_norm[last_peak_index]))
+    p_end = np.asarray((len(qrs_segment_norm) - 1, qrs_segment_norm[-1]))
+
+    for i in range(last_peak_index + 1, len(qrs_segment_norm)):
+        point = np.asarray((i, qrs_segment_norm[i]))
+        distance = np.linalg.norm(np.cross(p_end - p_start, p_start - point)) / np.linalg.norm(p_end - p_start)
+        if distance > max_dist:
+            max_dist = distance
+            qrs_offset = i
+
+    return qrs_offset
 
 
 def find_global_extremum(segment_orig: [float], segment_norm: [float]):
@@ -637,7 +663,7 @@ def process_t_waves():
                           f'Prominence = {round(t_waves[0].prominence, 2)} | '
                           f' Width = {round(t_waves[0].width, 2)} | '
                           f' Slope={round(st_line.slope, 3)} | '
-                          f'R={round(st_line.rvalue, 3)}')
+                          f' R={round(st_line.rvalue, 3)}')
                 plt.show()
                 v = 9
 
@@ -647,13 +673,13 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
     frequency = extracted_segments_dict[pid]['frequency']
     lead_name = Util.get_lead_name(index=lead_index)
     lead_qt_segments = [x[lead_index, :] for x in extracted_segments_dict[pid]['segments']]
+
     # Buffer vars for feature extraction from lead.
     lead_qrs_list = []
     lead_t_list = []
     lead_qrs_segment_norm = []
     lead_t_segment_norm = []
-    if ecg_id == 2054 and lead_name == 'V5':
-        v = 9
+
     for qt_segment in lead_qt_segments:
         qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
         t_segment = qt_segment[round(len(qt_segment) / 3):]
@@ -670,13 +696,16 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
 
         try:
             qrs = identify_qrs_waves(qrs_segment_orig=qrs_segment, qrs_segment_norm=qrs_segment_norm)
+            qrs_offset = identify_qrs_offset(qrs_segment_norm, qrs)
         except AssertionError:
             continue
 
-        # plt.plot(t_segment_norm)
+        # plt.plot(qt_segment)
+        # plt.axvline(x=qrs_offset, color='r')
+        # plt.title(f'{ecg_id} - {lead_name}')
         # plt.show()
-        t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
 
+        t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
 
         lead_qrs_list.append(qrs)
         lead_t_list.append(t_waves)
@@ -760,12 +789,14 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
         terminal_has_crossed = False
         non_terminal_has_crossed = False
         for notch in terminal_notches:
-            if cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index):
+            temp, _, _ = cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index)
+            if temp:
                 terminal_has_crossed = True
                 break
         terminal_notch_cross_list.append(terminal_has_crossed)
         for notch in non_terminal_notches:
-            if cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index):
+            temp, _, _ = cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index)
+            if temp:
                 non_terminal_has_crossed = True
                 break
         non_terminal_notch_cross_list.append(non_terminal_has_crossed)
