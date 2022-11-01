@@ -3,6 +3,8 @@ import statistics
 
 import numpy as np
 import pandas as pd
+import scipy
+import scipy.stats.mstats_basic
 from scipy import signal
 from random import shuffle
 from random import choice
@@ -13,8 +15,25 @@ import GlobalPaths
 from Utility import Util, SignalProcessing
 from sklearn.metrics import classification_report
 from scipy.stats import linregress
+from matplotlib.pyplot import figure
+import warnings
+from sklearn.model_selection import GridSearchCV
+import xgboost as xgb
+from sklearn.model_selection import KFold
+from sklearn import preprocessing
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-notch_prom_threshold = 0.1
+# import tensorflow
+
+# from tensorflow import keras
+
+# import keras
+# from keras.layers import Dense
+
+warnings.filterwarnings("ignore")
+
+notch_prom_threshold = 0.05
+non_terminal_notch_prom = 0.1
 wave_prom_threshold = 0.05
 
 
@@ -27,39 +46,52 @@ class Wave:
 
 
 class QRSComplex:
-    def __init__(self, segment_raw: [float], segment_norm: [float], interpret: dict, base_amp: float):
+    def __init__(self, segment_raw: [float], segment_norm: [float], interpret: dict, base_amp: float, width: int = None,
+                 duration: float = None, energy: float = None):
         self.segment_raw = segment_raw
         self.segment_norm = segment_norm
         self.interpret = interpret
         self.base_amp = base_amp
+        self.width = width
+        self.duration = duration
+        self.energy = energy
 
         for wave_name in self.interpret:
             self.get_wave(name=wave_name)
 
+    # get_wave returns the actual prominence of waves and notches as seen in the original signal (not the normed sig).
     def get_wave(self, name: str):  # Returns None or [] if the wave does not exist.
         if name == 'notches':
             notches = []
             for notch in self.interpret[name]:
+                prom = signal.peak_prominences(x=self.segment_raw, peaks=[notch.peak_index])[0][0]
                 notches.append(Wave(peak_index=notch.peak_index,
-                                    prominence=notch.prominence,
+                                    prominence=prom,
                                     width=notch.width,
                                     amp=self.segment_raw[notch.peak_index]))
             return notches
         elif name == 'terminal_notches':
             notches = []
+            s = self.get_wave(name='S')
             for notch in self.interpret['notches']:
-                if notch.peak_index > round(0.6 * len(self.segment_norm)):
+                if notch.peak_index > round(0.6 * len(self.segment_norm)) or (
+                        s is not None and notch.peak_index > s.peak_index):
+                    prom = signal.peak_prominences(x=self.segment_raw, peaks=[notch.peak_index])[0][0]
                     notches.append(Wave(peak_index=notch.peak_index,
-                                        prominence=notch.prominence,
+                                        prominence=prom,
                                         width=notch.width,
                                         amp=self.segment_raw[notch.peak_index]))
             return notches
         elif name == 'non_terminal_notches':
             notches = []
+            s = self.get_wave(name='S')
             for notch in self.interpret['notches']:
-                if notch.peak_index < round(0.6 * len(self.segment_norm)):
+                if notch.prominence > non_terminal_notch_prom and \
+                        ((s is None and notch.peak_index < round(0.6 * len(self.segment_norm))) or (
+                                s is not None and notch.peak_index < s.peak_index)):
+                    prom = signal.peak_prominences(x=self.segment_raw, peaks=[notch.peak_index])[0][0]
                     notches.append(Wave(peak_index=notch.peak_index,
-                                        prominence=notch.prominence,
+                                        prominence=prom,
                                         width=notch.width,
                                         amp=self.segment_raw[notch.peak_index]))
             return notches
@@ -67,7 +99,7 @@ class QRSComplex:
             peak_index = self.interpret[name]
             if peak_index == -1:
                 return None
-            segment = self.segment_norm
+            segment = self.segment_raw
             if name == 'Q' or name == 'S':
                 segment = [-1 * x for x in self.segment_norm]
             prominence = signal.peak_prominences(x=segment, peaks=[peak_index])[0][0]
@@ -80,11 +112,23 @@ class QRSComplex:
             return Wave(peak_index=peak_index, prominence=prominence, width=width, amp=amp)
 
 
+class Twave:
+    def __init__(self, segment_raw: [float], segment_norm: [float], primary_wave: Wave, st_line,
+                 biphasic_wave: Wave = None, onset: int = None, energy: float = None):
+        self.segment_raw = segment_raw
+        self.segment_norm = segment_norm
+        self.primary_wave = primary_wave
+        self.biphasic_wave = biphasic_wave
+        self.st_line = st_line
+        self.onset = onset
+        self.energy = energy
+
+
 def cross_baseline(segment: [float], base_amp: float, peak_index: int) -> (bool, int, int):
     left_leg_index = 0
     right_leg_index = len(segment) - 1
     prev_left_amp = segment[peak_index]
-    for i in range(peak_index-1, -1, -1):
+    for i in range(peak_index - 1, -1, -1):
         current_amp = segment[i]
         if current_amp > prev_left_amp:
             left_leg_index = i + 1
@@ -92,7 +136,7 @@ def cross_baseline(segment: [float], base_amp: float, peak_index: int) -> (bool,
         prev_left_amp = current_amp
 
     prev_right_amp = segment[peak_index]
-    for i in range(peak_index+1, len(segment), +1):
+    for i in range(peak_index + 1, len(segment), +1):
         current_amp = segment[i]
         if current_amp > prev_right_amp:
             right_leg_index = i - 1
@@ -117,7 +161,8 @@ def get_global_peak(segment: [float]):
     return global_extremum
 
 
-def identify_j_wave(qrs_segment_norm: [float], qrs_segment_orig: [float], r_index: int, s_index: int, notches: [Wave], base_amp: float):
+def identify_j_wave(qrs_segment_norm: [float], qrs_segment_orig: [float], r_index: int, s_index: int, notches: [Wave],
+                    base_amp: float):
     # Identifies J-wave, if present, and returns its Wave object. If J-wave is not present, it returns None.
     # J-wave: a positive wave to the right of R-wave that:
     #   1. Must also happen after S-wave (if present).
@@ -134,7 +179,7 @@ def identify_j_wave(qrs_segment_norm: [float], qrs_segment_orig: [float], r_inde
 
     target_notches = [w for w in notches if w.peak_index > ref_index]
     for notch in target_notches:
-        if qrs_segment_norm[notch.peak_index] > base_amp: # First check
+        if qrs_segment_norm[notch.peak_index] > base_amp:  # First check
             v = 9
 
 
@@ -279,12 +324,12 @@ def identify_qrs_offset(qrs_segment_norm: [float], qrs: QRSComplex) -> int:
     return qrs_offset
 
 
-def find_global_extremum(segment_orig: [float], segment_norm: [float]):
-    peak_indexes, _ = signal.find_peaks(x=segment_norm)
-    peak_prominences = signal.peak_prominences(x=segment_norm, peaks=peak_indexes)[0]
-    peak_widths = signal.peak_widths(x=segment_norm, peaks=peak_indexes, rel_height=1)[0]
+def find_global_extremum(segment_orig: [float]):
+    peak_indexes, _ = signal.find_peaks(x=segment_orig)
+    peak_prominences = signal.peak_prominences(x=segment_orig, peaks=peak_indexes)[0]
+    peak_widths = signal.peak_widths(x=segment_orig, peaks=peak_indexes, rel_height=1)[0]
 
-    segment_inverted = [-1 * x for x in segment_norm]
+    segment_inverted = [-1 * x for x in segment_orig]
     valley_indexes, _ = signal.find_peaks(x=segment_inverted)
     valley_prominences = signal.peak_prominences(x=segment_inverted, peaks=valley_indexes)[0]
     valley_widths = signal.peak_widths(x=segment_inverted, peaks=valley_indexes)[0]
@@ -293,25 +338,32 @@ def find_global_extremum(segment_orig: [float], segment_norm: [float]):
     extrema_prominences = np.concatenate((peak_prominences, valley_prominences))
     extrema_widths = np.concatenate((peak_widths, valley_widths))
 
-    extremum_idx_with_max_prom = max(zip(extrema_idx, extrema_prominences, extrema_widths), key=lambda x: x[1])
-
-    return Wave(peak_index=extremum_idx_with_max_prom[0],
-                prominence=extremum_idx_with_max_prom[1],
-                width=extremum_idx_with_max_prom[2],
-                amp=segment_orig[extremum_idx_with_max_prom[0]])
+    extrema = zip(extrema_idx, extrema_prominences, extrema_widths)
+    extrema = [ext for ext in extrema if ext[0] > 2]
+    if len(extrema) > 0:
+        extremum_idx_with_max_prom = max(extrema, key=lambda x: x[1])
+        return Wave(peak_index=extremum_idx_with_max_prom[0],
+                    prominence=extremum_idx_with_max_prom[1],
+                    width=extremum_idx_with_max_prom[2],
+                    amp=segment_orig[extremum_idx_with_max_prom[0]])
+    return None
 
 
 def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
     t_waves = []  # Single T-wave or biphasic T-wave.
 
-    smooth_w_len = round(len(t_segment_norm)/10)
+    smooth_w_len = round(len(t_segment_norm) / 10)
     t_segment_norm_smooth = SignalProcessing.smooth(x=t_segment_norm, window_len=smooth_w_len, window='flat')
     t_segment_orig_smooth = SignalProcessing.smooth(x=t_segment_orig, window_len=smooth_w_len, window='flat')
 
-    t_segment_norm = t_segment_norm_smooth[round(smooth_w_len / 2) - 1: len(t_segment_norm_smooth) - round(smooth_w_len / 2)]
-    t_segment_orig = t_segment_orig_smooth[round(smooth_w_len / 2) - 1: len(t_segment_orig_smooth) - round(smooth_w_len / 2)]
+    t_segment_norm = t_segment_norm_smooth[
+                     round(smooth_w_len / 2) - 1: len(t_segment_norm_smooth) - round(smooth_w_len / 2)]
+    t_segment_orig = t_segment_orig_smooth[
+                     round(smooth_w_len / 2) - 1: len(t_segment_orig_smooth) - round(smooth_w_len / 2)]
 
-    t_wave = find_global_extremum(segment_orig=t_segment_orig, segment_norm=t_segment_norm)
+    t_wave = find_global_extremum(segment_orig=t_segment_orig)
+    if t_wave is None:
+        raise AssertionError('could not identify global T peak.')
     t_waves.append(t_wave)
 
     if t_wave.amp > 0:
@@ -346,23 +398,33 @@ def find_t_peak(t_segment_norm: [float], t_segment_orig: [float]):
             max_dist = distance
             t_onset = i
 
+    if t_onset == -1:
+        plt.plot(t_segment_orig)
+        plt.show()
+        raise AssertionError('could not identify T onset.')
+
+    t_width = len(t_segment_orig) - t_onset + 1
+    t_waves[0].width = t_width
+
     x = np.array(list(range(t_onset)))
-    y = t_segment_norm[x]
+    y = t_segment_orig[x]
     st_line = linregress(x=x, y=y)
-    x = np.array(list(range(t_onset)))
     # plt.plot(t_segment_orig)
     # plt.plot(x, st_line.intercept + st_line.slope * x, 'r')
     # plt.show()
+    v = 9
     return t_waves, st_line, t_onset
 
 
-def plot_qrs_waves(qrs: QRSComplex, ax, i: int):
+def plot_qrs_waves(qrs: QRSComplex, ax=None, i: int = None):
+    if ax is None:
+        fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(4, 4))
+        i = 0
     ax[i].plot(qrs.segment_norm)
 
     q = qrs.get_wave(name='Q')
     r = qrs.get_wave(name='R')
     s = qrs.get_wave(name='S')
-    j = qrs.get_wave(name='J')
     notches = qrs.get_wave(name='notches')
 
     if q is not None:
@@ -376,10 +438,6 @@ def plot_qrs_waves(qrs: QRSComplex, ax, i: int):
     if s is not None:
         ax[i].scatter(x=s.peak_index, y=qrs.segment_norm[s.peak_index], color='g')
         ax[i].annotate(f'S-{round(s.prominence, 2)}', (s.peak_index, qrs.segment_norm[s.peak_index]))
-
-    if j is not None:
-        ax[i].scatter(x=j.peak_index, y=qrs.segment_norm[j.peak_index], color='m')
-        ax[i].annotate(f'J-{round(j.prominence, 2)}', (j.peak_index, qrs.segment_norm[j.peak_index]))
 
     for notch in notches:
         ax[i].scatter(x=notch.peak_index, y=qrs.segment_norm[notch.peak_index], color='b')
@@ -413,7 +471,8 @@ def find_positive_waves(segment: [float], min_prominence: float = 0.0, global_ma
     for i in range(len(all_peak_indexes)):
         if all_peak_prominences[i] > min_prominence:
             if global_max is not None and all_peak_indexes[i] != global_max:
-                wave = Wave(peak_index=all_peak_indexes[i], prominence=all_peak_prominences[i], width=all_peak_widths[i])
+                wave = Wave(peak_index=all_peak_indexes[i], prominence=all_peak_prominences[i],
+                            width=all_peak_widths[i])
                 result.append(wave)
     return sorted(result, key=lambda x: x.peak_index)
 
@@ -463,7 +522,8 @@ def identify_qrs_waves(qrs_segment_orig: [float], qrs_segment_norm: [float]):
         if interpret_result['S'] == -1:
             interpret_result['S'] = qs_dict['S']
 
-    return QRSComplex(segment_raw=qrs_segment_orig, segment_norm=qrs_segment_norm, interpret=interpret_result, base_amp=qrs_base_amp)
+    return QRSComplex(segment_raw=qrs_segment_orig, segment_norm=qrs_segment_norm, interpret=interpret_result,
+                      base_amp=qrs_base_amp)
 
 
 def process_website_ecgs():
@@ -519,7 +579,8 @@ def process_website_ecgs():
                 # The `interpret_qrs_peaks` function does not necessarily identify the Q and S waves when the R-wave
                 # exists (remember: its job is to identify and interpret `positive` waves).
                 if interpret_result['R'] != -1:
-                    qs_dict = identify_qs(segment_norm=qrs_segment_norm, r_index=interpret_result['R'], base_amp=qrs_base_amp)
+                    qs_dict = identify_qs(segment_norm=qrs_segment_norm, r_index=interpret_result['R'],
+                                          base_amp=qrs_base_amp)
                     if interpret_result['Q'] == -1:
                         interpret_result['Q'] = qs_dict['Q']
                     if interpret_result['S'] == -1:
@@ -537,7 +598,8 @@ def process_website_ecgs():
                 interpret_result['notches'] = non_terminal_notches
 
                 try:
-                    qrs = QRSComplex(segment_raw=qrs_segment, segment_norm=qrs_segment_norm, interpret=interpret_result, base_amp=qrs_base_amp)
+                    qrs = QRSComplex(segment_raw=qrs_segment, segment_norm=qrs_segment_norm, interpret=interpret_result,
+                                     base_amp=qrs_base_amp)
                     qrs_object_list.append(qrs)
                 except AssertionError as err:
                     print(err)
@@ -677,9 +739,10 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
     # Buffer vars for feature extraction from lead.
     lead_qrs_list = []
     lead_t_list = []
-    lead_qrs_segment_norm = []
-    lead_t_segment_norm = []
+    # lead_qrs_segment_norm = []
+    # lead_t_segment_norm = []
 
+    # Each lead has several QT segments. Loop over all of them and identify QRS and T-wave in each.
     for qt_segment in lead_qt_segments:
         qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
         t_segment = qt_segment[round(len(qt_segment) / 3):]
@@ -697,27 +760,50 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
         try:
             qrs = identify_qrs_waves(qrs_segment_orig=qrs_segment, qrs_segment_norm=qrs_segment_norm)
             qrs_offset = identify_qrs_offset(qrs_segment_norm, qrs)
+            if qrs_offset < 1:
+                continue
+            qrs.width = qrs_offset
+            qrs.duration = round((1 / frequency) * qrs_offset, 4)
+            # Calculate energy of signal: https://matel.p.lodz.pl/wee/i12zet/Signal%20energy%20and%20power.pdf
+            qrs.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qrs_segment[:qrs_offset + 1]])
+            # plot_qrs_waves(qrs)
+            # plt.show()
+            v = 9
         except AssertionError:
             continue
 
+        try:
+            t_waves, st_line, t_onset = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
+        except AssertionError:
+            continue
+        biphasic_wave = None
+        if len(t_waves) > 1:
+            biphasic_wave = t_waves[1]
+        twave = Twave(segment_raw=t_segment, segment_norm=t_segment_norm, primary_wave=t_waves[0], st_line=st_line,
+                      biphasic_wave=biphasic_wave, onset=t_onset)
+        twave.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qt_segment[qrs_offset + 1:]])
+        # x = np.array(list(range(round(len(qt_segment) / 3), round(len(qt_segment) / 3) + 20)))
+        # figure(figsize=(3, 6), dpi=80)
         # plt.plot(qt_segment)
-        # plt.axvline(x=qrs_offset, color='r')
-        # plt.title(f'{ecg_id} - {lead_name}')
+        # plt.scatter(x=twave.primary_wave.peak_index + t_offset, y=qt_segment[twave.primary_wave.peak_index + t_offset],
+        #             color='r')
+        # plt.scatter(x=twave.onset + t_offset, y=qt_segment[twave.onset + t_offset],
+        #             color='b')
+        # plt.plot(x, st_line.intercept + st_line.slope * x, 'r')
+        # plt.title(f'Slope={round(twave.st_line.slope, 3)}')
         # plt.show()
-
-        t_waves = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
+        v = 9
 
         lead_qrs_list.append(qrs)
-        lead_t_list.append(t_waves)
-        lead_t_segment_norm.append(t_segment_norm)
-        lead_qrs_segment_norm.append(qrs_segment_norm)
+        lead_t_list.append(twave)
 
-    lead_feature_vector = {'Q': 0, 'R': 0, 'S': 0,
+    lead_feature_vector = {'Q': 0, 'R': 0, 'S': 0, 'QRS_duration': 0,
                            'terminal_notches': 0, 'non_terminal_notches': 0, 'cross_baseline': False,
                            'max_prominence': 0,
                            'T': 0, 'T2': False, 't_prominence': 0, 't_width': 0}
 
-    # Step 1: Extract Q, R, and S amps.
+    # Step 1: Extract Q, R, and S amps and QRS prominence:
+    # QRS prominence = max prominence among Q, R, and S.
     q_list = []
     r_list = []
     s_list = []
@@ -755,6 +841,9 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
     elif len(s_list) == 1:
         lead_feature_vector['S'] = s_list[0].amp
 
+    lead_feature_vector['QRS_duration'] = statistics.mean([qrs.width for qrs in lead_qrs_list]) * (1 / frequency)
+    lead_feature_vector['QRS_energy'] = statistics.mean([qrs.energy for qrs in lead_qrs_list])
+
     # Step 2: Handle notches.
     lead_feature_vector['terminal_notches'] = max(
         [len(qrs_notches) for qrs_notches in [qrs.get_wave(name='terminal_notches') for qrs in lead_qrs_list]])
@@ -779,62 +868,66 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
 
     terminal_notch_cross_list = []
     non_terminal_notch_cross_list = []
-    for i in range(len(lead_qrs_list)):
-        qrs = lead_qrs_list[i]
-        qrs_base_amp = qrs.base_amp
-        qrs_segment = lead_qrs_segment_norm[i]
-
+    for qrs in lead_qrs_list:
         terminal_notches = qrs.get_wave(name='terminal_notches')
         non_terminal_notches = qrs.get_wave(name='non_terminal_notches')
-        terminal_has_crossed = False
-        non_terminal_has_crossed = False
+        terminal_has_crossed = 0
+        non_terminal_has_crossed = 0
         for notch in terminal_notches:
-            temp, _, _ = cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index)
+            temp, _, _ = cross_baseline(segment=qrs.segment_norm, base_amp=qrs.base_amp, peak_index=notch.peak_index)
             if temp:
-                terminal_has_crossed = True
+                terminal_has_crossed = 1
                 break
         terminal_notch_cross_list.append(terminal_has_crossed)
         for notch in non_terminal_notches:
-            temp, _, _ = cross_baseline(segment=qrs_segment, base_amp=qrs_base_amp, peak_index=notch.peak_index)
+            temp, _, _ = cross_baseline(segment=qrs.segment_norm, base_amp=qrs.base_amp, peak_index=notch.peak_index)
             if temp:
-                non_terminal_has_crossed = True
+                non_terminal_has_crossed = 1
                 break
         non_terminal_notch_cross_list.append(non_terminal_has_crossed)
 
-    lead_feature_vector['terminal_has_crossed'] = any(terminal_notch_cross_list)
-    lead_feature_vector['non_terminal_has_crossed'] = any(non_terminal_notch_cross_list)
+    lead_feature_vector['terminal_has_crossed'] = int(any(terminal_notch_cross_list))
+    lead_feature_vector['non_terminal_has_crossed'] = int(any(non_terminal_notch_cross_list))
 
     # Step 3: Handle T-wave.
-    # TODO: A wave's width must be proportional to its sampling frequency.
-    # TODO: Slope of the line intercepting QRS_end and left leg of T-wave.
-    lead_feature_vector['T'] = statistics.mean([t_waves[0].amp for t_waves in lead_t_list])
-    lead_feature_vector['t_prominence'] = statistics.mean([t_waves[0].prominence for t_waves in lead_t_list])
-    lead_feature_vector['t_width'] = statistics.mean([t_waves[0].width for t_waves in lead_t_list])
-    lead_feature_vector['T2'] = any([True if len(t_waves) > 1 else False for t_waves in lead_t_list])
+    # TODO: A wave's width must be proportional to its sampling frequency. -> Done!
+    # TODO: Slope of the line intercepting QRS_end and left leg of T-wave. -> Done!
+    lead_feature_vector['T'] = statistics.mean([t.primary_wave.amp for t in lead_t_list])
+    lead_feature_vector['t_prominence'] = statistics.mean([t.primary_wave.prominence for t in lead_t_list])
+    lead_feature_vector['t_duration'] = statistics.mean([t.primary_wave.width for t in lead_t_list]) * (1 / frequency)
+    lead_feature_vector['T2'] = any([True if t.biphasic_wave is not None else False for t in lead_t_list])
+    lead_feature_vector['st_slope'] = statistics.mean([t.st_line.slope for t in lead_t_list])
+    lead_feature_vector['st_slope_min'] = min([t.st_line.slope for t in lead_t_list])
+    lead_feature_vector['st_slope_max'] = max([t.st_line.slope for t in lead_t_list])
+    lead_feature_vector['st_rvalue'] = statistics.mean([t.st_line.rvalue for t in lead_t_list])
+    lead_feature_vector['t_energy'] = statistics.mean([t.energy for t in lead_t_list])
 
-    for key in lead_feature_vector:
-        if isinstance(lead_feature_vector[key], float):
-            if abs(lead_feature_vector[key]) > 1:
-                lead_feature_vector[key] = round(lead_feature_vector[key], 1)
-            else:
-                lead_feature_vector[key] = round(lead_feature_vector[key], 3)
-
-    lead_signal = extracted_segments_dict[pid]['ecg_denoised'][lead_name].values
-    plt.figure(figsize=(30, 12))
-    plt.plot(lead_signal)
-    title = f"{pid} - {ecg_id} - {lead_name}\n " \
-            f"Q={lead_feature_vector['Q']}   R={lead_feature_vector['R']}    S={lead_feature_vector['S']}\n" \
-            f"Non-TerminalNotchCount={lead_feature_vector['non_terminal_notches']}   TerminalNotchCount={lead_feature_vector['terminal_notches']}\n" \
-            f"QRSProm={lead_feature_vector['QRS_prominence']}    Non-TerminalProm={lead_feature_vector['non_terminal_prominence']}   TerminalProm={lead_feature_vector['terminal_prominence']}\n" \
-            f"Non-TerminalHasCrossed?={lead_feature_vector['non_terminal_has_crossed']}  TerminalHasCrossed?={lead_feature_vector['terminal_has_crossed']}\n" \
-            f"T={lead_feature_vector['T']}   T2={lead_feature_vector['T2']}  T_Prom={lead_feature_vector['t_prominence']}    T_width={lead_feature_vector['t_width']}"
-    plt.title(title, fontsize=14)
-    plt.show()
+    # for key in lead_feature_vector:
+    #     if isinstance(lead_feature_vector[key], float):
+    #         if abs(lead_feature_vector[key]) > 1:
+    #             lead_feature_vector[key] = round(lead_feature_vector[key], 1)
+    #         else:
+    #             lead_feature_vector[key] = round(lead_feature_vector[key], 3)
+    #
+    # lead_signal = extracted_segments_dict[pid]['ecg_denoised'][lead_name].values
+    # plt.figure(figsize=(30, 19))
+    # plt.plot(lead_signal)
+    # title = f"{pid} - {ecg_id} - {lead_name}\n " \
+    #         f"Q={lead_feature_vector['Q']}   R={lead_feature_vector['R']}    S={lead_feature_vector['S']} QRS_dur={lead_feature_vector['QRS_duration']} QRS_energy={lead_feature_vector['QRS_energy']:,}\n" \
+    #         f"Non-TerminalNotchCount={lead_feature_vector['non_terminal_notches']}   TerminalNotchCount={lead_feature_vector['terminal_notches']}\n" \
+    #         f"QRSProm={lead_feature_vector['QRS_prominence']}    Non-TerminalProm={lead_feature_vector['non_terminal_prominence']}   TerminalProm={lead_feature_vector['terminal_prominence']}\n" \
+    #         f"Non-TerminalHasCrossed?={lead_feature_vector['non_terminal_has_crossed']}  TerminalHasCrossed?={lead_feature_vector['terminal_has_crossed']}\n" \
+    #         f"T={lead_feature_vector['T']}   T2={lead_feature_vector['T2']}  T_Prom={lead_feature_vector['t_prominence']}    T_dur={lead_feature_vector['t_duration']} T_energy={lead_feature_vector['t_energy']:,}\n" \
+    #         f"ST_slope={lead_feature_vector['st_slope']},    Slope_max={lead_feature_vector['st_slope_max']},    Slope_min={lead_feature_vector['st_slope_min']}  ST_rvalue={lead_feature_vector['st_rvalue']}"
+    # plt.title(title, fontsize=20)
+    # plt.xticks(np.arange(0, len(lead_signal) + 1, 50))
+    # plt.gca().xaxis.grid(True)
+    # plt.show()
     v = 9
     return lead_feature_vector
 
 
-def process_for_ml():
+def process_website_ecg_for_ml():
     extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.website_ecg,
                                    ann_dir_path=GlobalPaths.website_pla_annotation,
                                    metadata_path=GlobalPaths.website_ecg_meta,
@@ -842,7 +935,7 @@ def process_for_ml():
     extracted_segments_dict = extractor.extract_segments()
     pids = list(extracted_segments_dict.keys())
 
-    # f = extract_features(extracted_segments_dict, pid=10158, lead_index=3)
+    # f = extract_features(extracted_segments_dict, pid=10650, lead_index=Util.get_lead_id(lead_name='aVR'))
 
     for _ in range(20):
         pid = random.choice(pids)
@@ -855,16 +948,184 @@ def process_for_ml():
     #         f = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
 
 
+def process_scar_ecg_for_ml():
+    try:
+        result = pd.read_csv('Data/ecg_feature_scar.csv')
+        run_xgboost(result)
+    except FileNotFoundError:
+        scar_columns = ['Record_ID', 'HCM type', 'Basal A', 'Basal S', 'Basal I', 'Basal L', 'Mid A', 'Mid S', 'Mid I',
+                        'Mid L', 'Apical A', 'Apical S', 'Apical I', 'Apical L', 'Apex']
+        scar_loc_df = pd.read_excel(GlobalPaths.scar_location)[scar_columns]
+        scar_loc_df = scar_loc_df[scar_loc_df[scar_columns[2]].notna()]
+
+        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID']]
+        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID']]
+        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID']]
+        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID']]
+
+        scar_loc_4_areas = []
+        for _, row in scar_loc_df.iterrows():
+            pid = row['Record_ID']
+            basal = int(any(basal_df.loc[basal_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+            mid = int(any(mid_df.loc[mid_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+            apical = int(any(apical_df.loc[apical_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+            apex = int(any(apex_df.loc[apex_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+            new_row = [pid, basal, mid, apical, apex]
+            scar_loc_4_areas.append(new_row)
+
+        scar_loc_4_areas = pd.DataFrame(data=scar_loc_4_areas, columns=['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'])
+
+        # Prepare ECG feature dataset.
+        extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                       ann_dir_path=GlobalPaths.pla_annotation,
+                                       metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                       verbose=True)
+        extracted_segments_dict = extractor.extract_segments()
+        pids = list(extracted_segments_dict.keys())
+
+        ecg_feature_ds = []
+        ecg_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy',
+                        'non_terminal_notches', 'terminal_notches', 'QRS_prominence', 'non_terminal_prominence',
+                        'terminal_prominence',
+                        'T', 't_prominence', 't_duration', 't_energy',
+                        'st_slope', 'st_slope_max', 'st_slope_min', 'st_rvalue',
+                        'non_terminal_has_crossed', 'terminal_has_crossed']
+
+        count = 0
+        for pid in pids:
+            patient_feature_vector = []
+            for lead_index in range(12):
+                # if pid != 10347 or lead_index != 7:
+                #     continue
+                lead_feature_vector = []
+                feature_dict = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
+                for feature in ecg_features:
+                    lead_feature_vector.append(feature_dict[feature])
+                patient_feature_vector.extend(lead_feature_vector)
+            patient_feature_vector.insert(0, pid)
+            ecg_feature_ds.append(patient_feature_vector)
+            count += 1
+            if count % 10 == 0:
+                print(f'{count}/{len(pids)} subjects processed')
+            # if count == 30:
+            #     break
+            v = 9
+
+        ecg_columns = ['Record_ID']
+        for lead_index in range(12):
+            lead_name = Util.get_lead_name(lead_index)
+            for feature in ecg_features:
+                col_name = '_' + lead_name + '_' + feature
+                ecg_columns.append(col_name)
+        ecg_feature_ds = pd.DataFrame(data=ecg_feature_ds, columns=ecg_columns)
+        result = pd.merge(left=scar_loc_4_areas, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        result.to_csv('Data/ecg_feature_scar.csv')
+
+
+def run_xgboost(result: pd.DataFrame):
+    # Consider only features from leads II, aVF, V2, V6.
+    # TODO: Maybe try other leads too. Or, increase/decrease the number of leads.
+    result = result[[col for col in result.columns
+                     if '_II_' in col or
+                     '_aVF_' in col or
+                     '_V2_' in col or
+                     '_V6_' in col] +
+                    ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+
+    # Perform binary classification for each of the basal, mid, apical, and apex areas.
+    basal_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Apex']]]
+    mid_ds = result[[col for col in result.columns if col not in ['Basal', 'Apical', 'Apex']]]
+    apical_ds = result[[col for col in result.columns if col not in ['Mid', 'Basal', 'Apex']]]
+    apex_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Basal']]]
+
+    df = apical_ds
+
+    # Phase 1: GridSearch for hyper-tuning XGBoostClassifier.
+    # param_grid = {
+    #     "max_depth": [3, 4, 5, 7],
+    #     "learning_rate": [0.01, 0.05, 0.1, 0.3],
+    #     "gamma": [0, 0.25, 1, 3],
+    #     "reg_lambda": [0, 1, 10, 30],
+    #     "scale_pos_weight": [1, 3, 5],
+    #     "subsample": [0.5, 0.8],
+    #     "colsample_bytree": [0.3, 0.5, 0.8, 1],
+    # }
+    # xgb_cl = xgb.XGBClassifier(objective="binary:logistic")
+    # grid_cv = GridSearchCV(xgb_cl, param_grid, n_jobs=-1, scoring="roc_auc", cv=3, verbose=1)
+    # _ = grid_cv.fit(X=df.iloc[:, 0:-2].values, y=df.iloc[:, -1].values)
+    # print(f'GridSearch Best Score = {grid_cv.best_score_}')
+    # print(f'For Parameters:\n{grid_cv.best_params_}')
+
+    # Phase 2: Perform classification via XGBoost using the best params obtained in the GridSearch phase.
+    kf = KFold(n_splits=5, shuffle=True, random_state=123)
+    acc_list = []
+    f1_list = []
+    auc_list = []
+    for split in kf.split(df):
+        train = df.iloc[split[0]]
+        test = df.iloc[split[1]]
+        train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
+        test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+
+        xgb_cl = xgb.XGBClassifier(objective="binary:logistic",
+                                   colsample_bytree=1,
+                                   gamma=0.25,
+                                   learning_rate=0.1,
+                                   max_depth=5,
+                                   reg_lambda=10,
+                                   scale_pos_weight=1,
+                                   subsample=0.6)
+        # grid_cv = GridSearchCV(xgb_cl, param_grid, n_jobs=-1, cv=3, scoring="roc_auc")
+        # _ = grid_cv.fit(train_x, train_y)
+        # print(grid_cv.best_score_)
+        # print(grid_cv.best_params_)
+        xgb_cl.fit(train_x, train_y)
+        preds = xgb_cl.predict(test_x)
+        acc = accuracy_score(test_y, preds)
+        f1 = f1_score(test_y, preds)
+        auc = roc_auc_score(test_y, preds)
+        acc_list.append(acc)
+        f1_list.append(f1)
+        auc_list.append(auc)
+        # print(f'Accuracy = {round(acc * 100, 2)}%')
+        # print(f'F1 = {round(f1 * 100, 2)}%')
+        # print(f'AUC = {round(auc * 100, 2)}%')
+    print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
+    print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
+    print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
+
+
+def run_nn(df: pd.DataFrame):
+    kf = KFold(n_splits=5, shuffle=True, random_state=123)
+    for split in kf.split(df):
+        print(f'\n------')
+        train = df.iloc[split[0]]
+        test = df.iloc[split[1]]
+        train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
+        test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+
+        min_max_scaler = preprocessing.MinMaxScaler()
+        train_x = np.concatenate(min_max_scaler.fit_transform(train_x[:, :-2]), train_x[:, -2:], axis=1)
+        test_x = np.concatenate(min_max_scaler.transform(test_x[:, :-2]), test_x[:, -2:], axis=1)
+
+        model = keras.Sequential()
+        model.add(keras.layers.Dense(32, input_shape=(train_x.shape[1],), activation='relu'))
+        model.add(keras.layers.Dense(16, activation='relu'))
+        model.add(keras.layers.Dense(1, activation='softmax'))
+        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+        model.fit(train_x, train_y, epochs=50, batch_size=10)
+        preds = (model.predict(test_x) > 0.5).astype(int)
+        acc = accuracy_score(test_y, preds)
+        f1 = f1_score(test_y, preds)
+        auc = roc_auc_score(test_y, preds)
+        print(f'Accuracy = {round(acc * 100, 2)}%')
+        print(f'F1 = {round(f1 * 100, 2)}%')
+        print(f'AUC = {round(auc * 100, 2)}%')
+
+
 if __name__ == '__main__':
     # process_website_ecgs()
-    process_t_waves()
-    # process_for_ml()
-
-
-
-
-
-
-
-
-
+    # process_t_waves()
+    # process_website_ecg_for_ml()
+    process_scar_ecg_for_ml()

@@ -11,5 +11,6 @@ cached_scar_ecg_meta: str = 'Data/ECG/ScarECG/scar_ecg_meta.xlsx'
 website_ecg_meta: str = 'Data/ECG/WebsiteECG/website_ecg_meta.xlsx'
 qt_segment_dataset: str = 'Data/Dataset/QTSegment'
 cached_qt_segment_dataset: str = 'Data/Dataset/QTSegment/qt_segment_dataset.npy'
+scar_location = '/Users/kasra/OneDrive - University of Delaware - o365/UCSF Data/HCM_LGElocalization_Database_03022022.xlsx'
 
 
