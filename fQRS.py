@@ -21,7 +21,14 @@ from sklearn.model_selection import GridSearchCV
 import xgboost as xgb
 from sklearn.model_selection import KFold
 from sklearn import preprocessing
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn import svm
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+
+import tensorflow
+from tensorflow import keras
 
 # import tensorflow
 
@@ -950,18 +957,22 @@ def process_website_ecg_for_ml():
 
 def process_scar_ecg_for_ml():
     try:
-        result = pd.read_csv('Data/ecg_feature_scar.csv')
-        run_xgboost(result)
+        # result = pd.read_csv('Data/ecg_feature_scar.csv')
+        # run_xgboost(result)
+        result = pd.read_csv('Data/ecg_feature_hypertrophy.csv')
+        predict_hypertrophy(dataset=result)
+        # run_nn(result)
     except FileNotFoundError:
         scar_columns = ['Record_ID', 'HCM type', 'Basal A', 'Basal S', 'Basal I', 'Basal L', 'Mid A', 'Mid S', 'Mid I',
                         'Mid L', 'Apical A', 'Apical S', 'Apical I', 'Apical L', 'Apex']
         scar_loc_df = pd.read_excel(GlobalPaths.scar_location)[scar_columns]
         scar_loc_df = scar_loc_df[scar_loc_df[scar_columns[2]].notna()]
 
-        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID']]
-        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID']]
-        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID']]
-        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID']]
+        hypertrophy_df = scar_loc_df[['Record_ID', 'HCM type']]
+        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID', 'HCM type']]
+        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID', 'HCM type']]
+        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID', 'HCM type']]
+        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID', 'HCM type']]
 
         scar_loc_4_areas = []
         for _, row in scar_loc_df.iterrows():
@@ -1018,8 +1029,78 @@ def process_scar_ecg_for_ml():
                 col_name = '_' + lead_name + '_' + feature
                 ecg_columns.append(col_name)
         ecg_feature_ds = pd.DataFrame(data=ecg_feature_ds, columns=ecg_columns)
-        result = pd.merge(left=scar_loc_4_areas, right=ecg_feature_ds, how="inner", on=["Record_ID"])
-        result.to_csv('Data/ecg_feature_scar.csv')
+
+        result_scar = pd.merge(left=scar_loc_4_areas, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        result_scar.to_csv('Data/ecg_feature_scar.csv')
+
+        result_hypertrophy = pd.merge(left=hypertrophy_df, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        result_hypertrophy.to_csv('Data/ecg_feature_hypertrophy.csv')
+
+
+def contain_leads(col_name: str, lead_names: [str]):
+    for lead_name in lead_names:
+        if f'_{lead_name}_' in col_name:
+            return True
+    return False
+
+
+def predict_hypertrophy(dataset: pd.DataFrame):
+    # Consider only features from leads II, aVF, V2, V6.
+    # TODO: Maybe try other leads too. Or, increase/decrease the number of leads.
+    dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', 'HCM type']]
+    dataset.dropna(inplace=True)
+
+    models = {
+        # 'LogisticRegression': LogisticRegression(solver='lbfgs', multi_class='ovr'),
+        # 'SVM': svm.LinearSVC(),
+        'RF': RandomForestClassifier(n_estimators=100, max_depth=7),
+        # 'XGB': xgb.XGBClassifier(objective="binary:logistic",
+        #                                colsample_bytree=1,
+        #                                gamma=0.25,
+        #                                learning_rate=0.1,
+        #                                max_depth=5,
+        #                                reg_lambda=10,
+        #                                scale_pos_weight=1,
+        #                                subsample=0.8),
+        # 'MLP': MLPClassifier(alpha=1e-3, hidden_layer_sizes=(130,))
+    }
+
+    for model_name in models:
+        model = models[model_name]
+        print(f'\n--- Model = {model_name} ---\n')
+
+        acc_list, f1_list, auc_list = [], [], []
+        kf = KFold(n_splits=10, shuffle=True, random_state=123)
+        for split in kf.split(dataset):
+            train = dataset.iloc[split[0]]
+            test = dataset.iloc[split[1]]
+            train_x, train_y = train.iloc[:, 0:-2], train.iloc[:, -1].values
+            test_x, test_y = test.iloc[:, 0:-2], test.iloc[:, -1].values
+
+            train_x_continuous = train_x[[col for col in train_x.columns if 'has_' not in col]]
+            train_x_categorical = train_x[[col for col in train_x.columns if 'has_' in col]]
+            test_x_continuous = test_x[[col for col in test_x.columns if 'has_' not in col]]
+            test_x_categorical = test_x[[col for col in test_x.columns if 'has_' in col]]
+
+            scaler = preprocessing.StandardScaler()
+            train_x = np.concatenate((scaler.fit_transform(train_x_continuous.values), train_x_categorical.values), axis=1)
+            test_x = np.concatenate((scaler.transform(test_x_continuous.values), test_x_categorical.values), axis=1)
+
+            model.fit(train_x, train_y)
+            preds = model.predict(test_x)
+            acc = accuracy_score(test_y, preds)
+            f1 = f1_score(test_y, preds, average='weighted')
+            # auc = roc_auc_score(test_y, preds, multi_class='ovr')
+            acc_list.append(acc)
+            f1_list.append(f1)
+            # auc_list.append(auc)
+            # print(confusion_matrix(test_y, preds))
+            # print(f'Accuracy = {round(acc * 100, 2)}%')
+            # print(f'F1 = {round(f1 * 100, 2)}%')
+            # print(f'AUC = {round(auc * 100, 2)}%')
+        print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
+        print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
+        # print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
 
 
 def run_xgboost(result: pd.DataFrame):
@@ -1029,8 +1110,11 @@ def run_xgboost(result: pd.DataFrame):
                      if '_II_' in col or
                      '_aVF_' in col or
                      '_V2_' in col or
-                     '_V6_' in col] +
-                    ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+                     '_V6_' in col
+                     ] +
+                     ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+
+    result.dropna(inplace=True)
 
     # Perform binary classification for each of the basal, mid, apical, and apex areas.
     basal_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Apex']]]
@@ -1038,7 +1122,7 @@ def run_xgboost(result: pd.DataFrame):
     apical_ds = result[[col for col in result.columns if col not in ['Mid', 'Basal', 'Apex']]]
     apex_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Basal']]]
 
-    df = apical_ds
+    df = mid_ds
 
     # Phase 1: GridSearch for hyper-tuning XGBoostClassifier.
     # param_grid = {
@@ -1057,30 +1141,103 @@ def run_xgboost(result: pd.DataFrame):
     # print(f'For Parameters:\n{grid_cv.best_params_}')
 
     # Phase 2: Perform classification via XGBoost using the best params obtained in the GridSearch phase.
-    kf = KFold(n_splits=5, shuffle=True, random_state=123)
+
+    models = {'LogisticRegression': LogisticRegression(solver='lbfgs', multi_class='ovr'),
+              'SVM': svm.LinearSVC(),
+              'RF': RandomForestClassifier(n_estimators=100, max_depth=5),
+              'XGB': xgb.XGBClassifier(objective="binary:logistic",
+                                colsample_bytree=1,
+                                gamma=0.25,
+                                learning_rate=0.1,
+                                max_depth=5,
+                                reg_lambda=10,
+                                scale_pos_weight=1,
+                                subsample=0.8),
+              'MLP': MLPClassifier(alpha=1e-3, hidden_layer_sizes=(130,))}
+
+    for model_name in models:
+        model = models[model_name]
+        print(f'\n--- Model = {model_name} ---\n')
+
+        acc_list = []
+        f1_list = []
+        auc_list = []
+        kf = KFold(n_splits=10, shuffle=True, random_state=123)
+        for split in kf.split(df):
+            train = df.iloc[split[0]]
+            test = df.iloc[split[1]]
+            train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
+            test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+
+            scaler = preprocessing.StandardScaler()
+            train_x = np.concatenate((scaler.fit_transform(train_x[:, :-2]), train_x[:, -2:]), axis=1)
+            test_x = np.concatenate((scaler.transform(test_x[:, :-2]), test_x[:, -2:]), axis=1)
+
+            # v = np.isnan(train_x)
+            # for i in range(v.shape[0]):
+            #     for j in range(v.shape[1]):
+            #         if v[i, j] == True:
+            #             bb = 9
+            model.fit(train_x, train_y)
+            preds = model.predict(test_x)
+            acc = accuracy_score(test_y, preds)
+            f1 = f1_score(test_y, preds)
+            auc = roc_auc_score(test_y, preds)
+            acc_list.append(acc)
+            f1_list.append(f1)
+            auc_list.append(auc)
+            # print(confusion_matrix(test_y, preds))
+            # print(f'Accuracy = {round(acc * 100, 2)}%')
+            # print(f'F1 = {round(f1 * 100, 2)}%')
+            # print(f'AUC = {round(auc * 100, 2)}%')
+        print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
+        print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
+        print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
+
+
+def run_nn(result: pd.DataFrame):
+    # Consider only features from leads II, aVF, V2, V6.
+    # TODO: Maybe try other leads too. Or, increase/decrease the number of leads.
+    result = result[[col for col in result.columns
+                     if '_II_' in col or
+                     '_aVF_' in col or
+                     '_V2_' in col or
+                     '_V6_' in col] +
+                    ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+
+    # Perform binary classification for each of the basal, mid, apical, and apex areas.
+    basal_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Apex']]]
+    mid_ds = result[[col for col in result.columns if col not in ['Basal', 'Apical', 'Apex']]]
+    apical_ds = result[[col for col in result.columns if col not in ['Mid', 'Basal', 'Apex']]]
+    apex_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Basal']]]
+
+    df = mid_ds
     acc_list = []
     f1_list = []
     auc_list = []
+    kf = KFold(n_splits=10, shuffle=True, random_state=123)
     for split in kf.split(df):
+        print(f'\n------')
         train = df.iloc[split[0]]
         test = df.iloc[split[1]]
         train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
         test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
 
-        xgb_cl = xgb.XGBClassifier(objective="binary:logistic",
-                                   colsample_bytree=1,
-                                   gamma=0.25,
-                                   learning_rate=0.1,
-                                   max_depth=5,
-                                   reg_lambda=10,
-                                   scale_pos_weight=1,
-                                   subsample=0.6)
-        # grid_cv = GridSearchCV(xgb_cl, param_grid, n_jobs=-1, cv=3, scoring="roc_auc")
-        # _ = grid_cv.fit(train_x, train_y)
-        # print(grid_cv.best_score_)
-        # print(grid_cv.best_params_)
-        xgb_cl.fit(train_x, train_y)
-        preds = xgb_cl.predict(test_x)
+        scaler = preprocessing.StandardScaler()
+        train_x = np.concatenate((scaler.fit_transform(train_x[:, :-2]), train_x[:, -2:]), axis=1)
+        test_x = np.concatenate((scaler.transform(test_x[:, :-2]), test_x[:, -2:]), axis=1)
+
+        model = keras.Sequential()
+        model.add(keras.layers.Dense(40, input_shape=(train_x.shape[1],), activation='relu'))
+        model.add(keras.layers.Dense(20, activation='relu'))
+        model.add(keras.layers.Dense(1, activation='sigmoid'))
+        model.compile(loss='binary_crossentropy',
+                      optimizer=keras.optimizers.Adam(lr=0.01),
+                      metrics=[keras.metrics.Accuracy(), keras.metrics.AUC()])
+
+        model.fit(train_x, train_y, epochs=50, batch_size=1)
+        preds1 = model.predict(test_x)
+        preds = (model.predict(test_x) > 0.5).astype(int)
         acc = accuracy_score(test_y, preds)
         f1 = f1_score(test_y, preds)
         auc = roc_auc_score(test_y, preds)
@@ -1093,35 +1250,6 @@ def run_xgboost(result: pd.DataFrame):
     print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
     print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
     print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
-
-
-def run_nn(df: pd.DataFrame):
-    kf = KFold(n_splits=5, shuffle=True, random_state=123)
-    for split in kf.split(df):
-        print(f'\n------')
-        train = df.iloc[split[0]]
-        test = df.iloc[split[1]]
-        train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
-        test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
-
-        min_max_scaler = preprocessing.MinMaxScaler()
-        train_x = np.concatenate(min_max_scaler.fit_transform(train_x[:, :-2]), train_x[:, -2:], axis=1)
-        test_x = np.concatenate(min_max_scaler.transform(test_x[:, :-2]), test_x[:, -2:], axis=1)
-
-        model = keras.Sequential()
-        model.add(keras.layers.Dense(32, input_shape=(train_x.shape[1],), activation='relu'))
-        model.add(keras.layers.Dense(16, activation='relu'))
-        model.add(keras.layers.Dense(1, activation='softmax'))
-        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-
-        model.fit(train_x, train_y, epochs=50, batch_size=10)
-        preds = (model.predict(test_x) > 0.5).astype(int)
-        acc = accuracy_score(test_y, preds)
-        f1 = f1_score(test_y, preds)
-        auc = roc_auc_score(test_y, preds)
-        print(f'Accuracy = {round(acc * 100, 2)}%')
-        print(f'F1 = {round(f1 * 100, 2)}%')
-        print(f'AUC = {round(auc * 100, 2)}%')
 
 
 if __name__ == '__main__':

@@ -37,23 +37,6 @@ class QTSegmentExtractor:
 
         return results
 
-    # def extract_qrs(self):
-    #     results = {}
-    #     for i in range(len(self.ecg_ids)):
-    #         ecg_id = self.ecg_ids[i]
-    #         pid = self.pids[i]
-    #         frequency = self.frequency_list[i]
-    #         segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
-    #         if pid in segment_dict:
-    #             p_results_dict = segment_dict[pid]
-    #             results[pid] = p_results_dict
-    #         else:
-    #             print(f'Skipping {pid}')
-    #         if self.verbose and i != 0 and i % 50 == 0:
-    #             print(f'--- {round(i/len(self.ecg_ids) * 100)}% Done')
-    #
-    #     return results
-
     def _parse_annotation(self, ecg_id: int, pid: int, frequency: int):
         results = {}
         ecg = Loader.ecg(path=os.path.join(self.ecg_dir_path, str(ecg_id) + '.csv'), frequency=frequency)
