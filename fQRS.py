@@ -8,6 +8,7 @@ import scipy.stats.mstats_basic
 from scipy import signal
 from random import shuffle
 from random import choice
+from scipy.stats import norm, ttest_ind
 from tslearn.preprocessing import TimeSeriesScalerMinMax, TimeSeriesScalerMeanVariance
 import matplotlib.pyplot as plt
 from QTSegmentExtractor import QTSegmentExtractor
@@ -26,6 +27,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn import svm
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
+from math import sin, cos, radians
+from DataManagement import EHRFeatureSelection
 
 import tensorflow
 from tensorflow import keras
@@ -540,7 +543,18 @@ def process_website_ecgs():
                                    metadata_path=GlobalPaths.website_ecg_meta,
                                    verbose=True)
     extracted_segments_dict = extractor.extract_segments()
+
     pids = list(extracted_segments_dict.keys())
+
+    # for _ in range(10):
+    #     ecg = extracted_segments_dict[random.choice(pids)]['ecg_denoised']
+    #     ecg_augmented = vcg_augmentation(np.transpose(ecg.values))
+    #     plt.figure("Original ECG", figsize=(15, 5))
+    #     plt.plot(ecg['V6'].values)
+    #     plt.figure("Augmented ECG", figsize=(15, 5))
+    #     plt.plot(ecg_augmented['V6'].values)
+    #     plt.show()
+    #     v = 9
 
     report_fp = []
     report_fn = []
@@ -957,10 +971,10 @@ def process_website_ecg_for_ml():
 
 def process_scar_ecg_for_ml():
     try:
-        # result = pd.read_csv('Data/ecg_feature_scar.csv')
-        # run_xgboost(result)
-        result = pd.read_csv('Data/ecg_feature_hypertrophy.csv')
-        predict_hypertrophy(dataset=result)
+        result = pd.read_csv('Data/ecg_feature_scar.csv')
+        # result = pd.read_csv('Data/ecg_feature_hypertrophy.csv')
+        # predict_hypertrophy(dataset=result)
+        predict_scar(dataset=result)
         # run_nn(result)
     except FileNotFoundError:
         scar_columns = ['Record_ID', 'HCM type', 'Basal A', 'Basal S', 'Basal I', 'Basal L', 'Mid A', 'Mid S', 'Mid I',
@@ -969,10 +983,10 @@ def process_scar_ecg_for_ml():
         scar_loc_df = scar_loc_df[scar_loc_df[scar_columns[2]].notna()]
 
         hypertrophy_df = scar_loc_df[['Record_ID', 'HCM type']]
-        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID', 'HCM type']]
-        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID', 'HCM type']]
-        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID', 'HCM type']]
-        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID', 'HCM type']]
+        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID']]
+        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID']]
+        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID']]
+        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID']]
 
         scar_loc_4_areas = []
         for _, row in scar_loc_df.iterrows():
@@ -1031,10 +1045,10 @@ def process_scar_ecg_for_ml():
         ecg_feature_ds = pd.DataFrame(data=ecg_feature_ds, columns=ecg_columns)
 
         result_scar = pd.merge(left=scar_loc_4_areas, right=ecg_feature_ds, how="inner", on=["Record_ID"])
-        result_scar.to_csv('Data/ecg_feature_scar.csv')
+        result_scar.to_csv('Data/ecg_feature_scar.csv', index=False)
 
         result_hypertrophy = pd.merge(left=hypertrophy_df, right=ecg_feature_ds, how="inner", on=["Record_ID"])
-        result_hypertrophy.to_csv('Data/ecg_feature_hypertrophy.csv')
+        result_hypertrophy.to_csv('Data/ecg_feature_hypertrophy.csv', index=False)
 
 
 def contain_leads(col_name: str, lead_names: [str]):
@@ -1103,26 +1117,38 @@ def predict_hypertrophy(dataset: pd.DataFrame):
         # print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
 
 
-def run_xgboost(result: pd.DataFrame):
+def predict_scar(dataset: pd.DataFrame):
     # Consider only features from leads II, aVF, V2, V6.
     # TODO: Maybe try other leads too. Or, increase/decrease the number of leads.
-    result = result[[col for col in result.columns
-                     if '_II_' in col or
-                     '_aVF_' in col or
-                     '_V2_' in col or
-                     '_V6_' in col
-                     ] +
-                     ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
-
-    result.dropna(inplace=True)
+    # dataset = dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+    dataset.dropna(inplace=True)
 
     # Perform binary classification for each of the basal, mid, apical, and apex areas.
-    basal_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Apex']]]
-    mid_ds = result[[col for col in result.columns if col not in ['Basal', 'Apical', 'Apex']]]
-    apical_ds = result[[col for col in result.columns if col not in ['Mid', 'Basal', 'Apex']]]
-    apex_ds = result[[col for col in result.columns if col not in ['Mid', 'Apical', 'Basal']]]
+    basal_ds = dataset[[col for col in dataset.columns if col not in ['Mid', 'Apical', 'Apex']]]
+    mid_ds = dataset[[col for col in dataset.columns if col not in ['Basal', 'Apical', 'Apex']]]
+    apical_ds = dataset[[col for col in dataset.columns if col not in ['Mid', 'Basal', 'Apex']]]
+    apex_ds = dataset[[col for col in dataset.columns if col not in ['Mid', 'Apical', 'Basal']]]
 
     df = mid_ds
+    target_col = 'Mid'
+    ttest_result = []
+    for col in df.columns:
+        if col not in ['Record_ID', target_col]:
+            _, p_value = ttest_ind(a=df.loc[df[target_col] == 0][col].values,
+                                   b=df.loc[df[target_col] == 1][col].values,
+                                   equal_var=False)
+            ttest_result.append((col, p_value))
+    ttest_result = sorted(ttest_result, key=lambda item: item[1])
+    ttest_result = [x for x in ttest_result if x[1] < 0.05]
+    EHRFeatureSelection.plot_feature_score(ttest_result, y_title='P-value', y_limit=0.05)
+
+    selected_features = [x[0] for x in ttest_result]
+    df = df[[col for col in df.columns if col in selected_features] + ['Record_ID', target_col]]
+
+    v = 9
+
+
+
 
     # Phase 1: GridSearch for hyper-tuning XGBoostClassifier.
     # param_grid = {
@@ -1166,18 +1192,20 @@ def run_xgboost(result: pd.DataFrame):
         for split in kf.split(df):
             train = df.iloc[split[0]]
             test = df.iloc[split[1]]
-            train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
-            test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+            train_x, train_y = train.iloc[:, 0:-2], train.iloc[:, -1].values
+            test_x, test_y = test.iloc[:, 0:-2], test.iloc[:, -1].values
+
+            train_x_continuous = train_x[[col for col in train_x.columns if 'has_' not in col]]
+            train_x_categorical = train_x[[col for col in train_x.columns if 'has_' in col]]
+            test_x_continuous = test_x[[col for col in test_x.columns if 'has_' not in col]]
+            test_x_categorical = test_x[[col for col in test_x.columns if 'has_' in col]]
 
             scaler = preprocessing.StandardScaler()
-            train_x = np.concatenate((scaler.fit_transform(train_x[:, :-2]), train_x[:, -2:]), axis=1)
-            test_x = np.concatenate((scaler.transform(test_x[:, :-2]), test_x[:, -2:]), axis=1)
+            train_x = np.concatenate((scaler.fit_transform(train_x_continuous.values), train_x_categorical.values),
+                                     axis=1)
+            test_x = np.concatenate((scaler.transform(test_x_continuous.values), test_x_categorical.values),
+                                    axis=1)
 
-            # v = np.isnan(train_x)
-            # for i in range(v.shape[0]):
-            #     for j in range(v.shape[1]):
-            #         if v[i, j] == True:
-            #             bb = 9
             model.fit(train_x, train_y)
             preds = model.predict(test_x)
             acc = accuracy_score(test_y, preds)
@@ -1250,6 +1278,68 @@ def run_nn(result: pd.DataFrame):
     print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
     print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
     print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
+
+
+def vcg_augmentation(ecg: np.ndarray):
+    dowers_matrix_inverse = [[0.156, -0.227, 0.022],
+                     [-0.010, 0.887, 0.102],
+                     [-0.172, 0.057, -0.229],
+                     [-0.074, -0.019, -0.310],
+                     [0.122, -0.106, -0.246],
+                     [0.231, -0.022, -0.063],
+                     [0.0239, 0.041, 0.055],
+                     [0.194, 0.048, 0.108]]
+
+    dowers_matrix = np.linalg.pinv(dowers_matrix_inverse)
+
+    r_x = radians(random.randint(-45, 45))
+    rotate_x = [[1, 0, 0],
+                [0, cos(r_x), -sin(r_x)],
+                [0, sin(r_x), cos(r_x)]]
+    r_y = radians(random.randint(-45, 45))
+    rotate_y = [[cos(r_y), 0, sin(r_y)],
+                [0, 1, 0],
+                [-sin(r_y), 0, cos(r_y)]]
+    r_z = radians(random.randint(-45, 45))
+    rotate_z = [[cos(r_z), -sin(r_z), 0],
+                [sin(r_z), cos(r_z), 0],
+                [0, 0, 1]]
+
+    if random.uniform(0, 1) > 0.5:
+        s_x = random.uniform(1, 1.5)
+    else:
+        s_x = random.uniform(1/1.5, 1)
+    if random.uniform(0, 1) > 0.5:
+        s_y = random.uniform(1, 1.5)
+    else:
+        s_y = random.uniform(1/1.5, 1)
+    if random.uniform(0, 1) > 0.5:
+        s_z = random.uniform(1, 1.5)
+    else:
+        s_z = random.uniform(1/1.5, 1)
+
+    scale = [[s_x, 0, 0],
+             [0, s_y, 0],
+             [0, 0, s_z]]
+
+    independent_leads = [0, 1, 6, 7, 8, 9, 10, 11]
+    ind_ecg = ecg[independent_leads, :]
+
+    a = np.matmul(np.transpose(dowers_matrix_inverse), ind_ecg)
+    b = np.matmul(rotate_x, a)
+    c = np.matmul(rotate_y, b)
+    d = np.matmul(rotate_z, c)
+    e = np.matmul(scale, d)
+    f = np.matmul(np.transpose(dowers_matrix), e)
+
+    lead_iii = f[0, :] - f[1, :]
+    lead_avl = (f[0, :] - lead_iii) / 2
+    lead_avr = -1 * (f[0, :] + f[1, :]) / 2
+    lead_avf = (f[1, :] + lead_iii) / 2
+
+    f1 = np.insert(f, 2, [lead_iii, lead_avr, lead_avl, lead_avf], axis=0)
+
+    return pd.DataFrame(np.transpose(f1), columns=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'])
 
 
 if __name__ == '__main__':
