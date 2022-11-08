@@ -1001,6 +1001,13 @@ def get_scar_location_dataset() -> pd.DataFrame:
     return pd.DataFrame(data=scar_loc_4_areas, columns=['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'])
 
 
+def get_scar_subregion(region_name: str) -> pd.DataFrame:
+    scar_df = pd.read_excel(GlobalPaths.scar_location)
+    scar_df = scar_df[[col for col in scar_df.columns if region_name in col] + ['Record_ID']]
+    scar_df.dropna(inplace=True)
+    return scar_df
+
+
 def get_ecg_feature_dataset(extracted_segments_dict: dict) -> pd.DataFrame:
     pids = list(extracted_segments_dict.keys())
 
@@ -1129,7 +1136,7 @@ def generate_augmented_ecg_ds():
     print('ECG augmentation done!')
 
 
-models = {'LogisticRegression': LogisticRegression(solver='lbfgs', multi_class='ovr'),
+models = {'LogisticRegression': LogisticRegression(solver='liblinear', multi_class='ovr'),
               'SVM': svm.LinearSVC(),
               'RF': RandomForestClassifier(n_estimators=100, max_depth=5, class_weight=None, criterion='log_loss'),
               'XGB': xgb.XGBClassifier(objective="binary:logistic",

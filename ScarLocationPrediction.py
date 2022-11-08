@@ -1,5 +1,6 @@
 import statistics
 import random
+from collections import Counter
 
 import numpy as np
 import xgboost as xgb
@@ -7,10 +8,13 @@ import pandas as pd
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
+from mlxtend.classifier import StackingClassifier
 
 import GlobalPaths
 from QTSegmentExtractor import QTSegmentExtractor
-from fQRS import get_ecg_scar_dataset, get_ecg_feature_dataset
+from fQRS import get_ecg_scar_dataset, get_ecg_feature_dataset, get_scar_location_dataset, get_scar_subregion
 
 param_grid = {
     "max_depth": [3, 4, 5, 7],
@@ -138,7 +142,24 @@ def predict_scar_grid_search_xgb_vcg_augmentation(region_name: str, select_top_f
     print(f'AUC = {round(statistics.mean(auc_runs) * 100, 2)}% ± {round(statistics.stdev(auc_runs) * 100, 2)}%')
 
 
-def predict_scar_tree(region_name: str, select_top_features: bool = False):
+def add_augmented_ds(train: pd.DataFrame):
+    dataset_augmented = pd.read_excel('cached_dataset_vcg_augmented.xlsx')
+    augmented_pids = set(dataset_augmented['Record_ID'].values)
+    real_pids = list(set(train['Record_ID'].values))
+    selected_pids = random.sample(real_pids, round(len(real_pids) * 0.5))
+    selected_augmented_ds = []
+    for pid in selected_pids:
+        pid_augmented = pid * 1000 + random.randint(1, 3)
+        if pid_augmented in augmented_pids:
+            row = dataset_augmented.loc[dataset_augmented['Record_ID'] == pid_augmented].values[0]
+            selected_augmented_ds.append(row)
+    selected_augmented_ds = pd.DataFrame(selected_augmented_ds, columns=dataset_augmented.columns)
+    train = pd.concat([train, selected_augmented_ds], ignore_index=True)
+    train = train.sample(frac=1).reset_index(drop=True)
+    return train
+
+
+def predict_scar_tree(region_name: str, select_top_features: bool = False, use_augmentation: bool = True):
     dataset, continuous_columns, discrete_columns = get_ecg_scar_dataset(region_name=region_name, select_top_features=select_top_features)
     # Check if `dataset` is well organized.
     if '_' in dataset.columns.values[-1]:
@@ -156,30 +177,115 @@ def predict_scar_tree(region_name: str, select_top_features: bool = False):
                               subsample=1)
 
     # model = RandomForestClassifier(n_estimators=100)
+    # model = LogisticRegression(solver='liblinear', multi_class='ovr')
+    # model = GaussianNB()
+
+    # model = StackingClassifier(
+    #     classifiers=[
+    #         GaussianNB(),
+    #         xgb.XGBClassifier(objective="binary:logistic",
+    #                           gamma=0.25,
+    #                           colsample_bytree=0.8,
+    #                           learning_rate=0.1,
+    #                           max_depth=5,
+    #                           reg_lambda=30,
+    #                           scale_pos_weight=0.8,
+    #                           subsample=1),
+    #         RandomForestClassifier(n_estimators=100),
+    #         LogisticRegression(solver='liblinear', multi_class='ovr')
+    #     ],
+    #     use_probas=True,
+    #     meta_classifier=GaussianNB()
+    # )
     conf_matrix_list = []
     run = 10
     for i in range(run):
         # print(f'\n--- Run {i+1} ---')
-        train_x, test_x, train_y, test_y = train_test_split(dataset.iloc[:, 0:-2].values,
-                                                            dataset.iloc[:, -1].values,
-                                                            test_size=0.3,
-                                                            shuffle=True)
+        train, test = train_test_split(dataset, test_size=0.3, shuffle=True)
+        if i == 0:
+            print(f'Train: {Counter(train.iloc[:, -1].values)}')
+            print(f'Test: {Counter(test.iloc[:, -1].values)}')
+        if use_augmentation:
+            train = add_augmented_ds(train)
+            if i == 0:
+                print(f'Train Augmented: {Counter(train.iloc[:, -1].values)}')
 
+        train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
         model.fit(train_x, train_y)
+
+        test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
         preds = model.predict(test_x)
+        preds_prob = model.predict_proba(test_x)
+
+        prediction_df = pd.DataFrame(
+            {
+                'Record_ID': test.iloc[:, -2].values,
+                'y_true': test_y,
+                'y_pred': preds,
+                'y_prob_0': preds_prob[:, 0],
+                'y_prob_1': preds_prob[:, 1]
+            })
+        scar_subregion_df = get_scar_subregion(region_name=region_name)
+        prediction_df = pd.merge(left=prediction_df, right=scar_subregion_df, how="inner", on=["Record_ID"])
+
+        mid_l_prediction = prediction_df.loc[prediction_df['Mid L'] == 1]
+        mid_l_tp = len(mid_l_prediction.loc[mid_l_prediction['y_pred'] == 1])
+        mid_l_fn = len(mid_l_prediction.loc[mid_l_prediction['y_pred'] == 0])
+
+        print(classification_report(prediction_df['y_true'].values, prediction_df['y_pred'].values))
+
+        fn_df = prediction_df.loc[(prediction_df['y_true'] == 1) & (prediction_df['y_pred'] == 0)]
+
+        prediction_df_confident = prediction_df.loc[(prediction_df['y_prob_0'] > 0.7) | (prediction_df['y_prob_1'] > 0.7)]
+        print(classification_report(prediction_df_confident['y_true'].values, prediction_df_confident['y_pred'].values))
+
+        prediction_df_no_s = prediction_df.loc[prediction_df['Mid S'] == 0]
+        # print(classification_report(prediction_df_no_s['y_true'].values, prediction_df_no_s['y_pred'].values))
+
+        tp_df_no_s = prediction_df_no_s.loc[(prediction_df_no_s['y_true'] == 1) & (prediction_df_no_s['y_pred'] == 1)]
+        tn_df_no_s = prediction_df_no_s.loc[(prediction_df_no_s['y_true'] == 0) & (prediction_df_no_s['y_pred'] == 0)]
+        fn_df_no_s = prediction_df_no_s.loc[(prediction_df_no_s['y_true'] == 1) & (prediction_df_no_s['y_pred'] == 0)]
+        fp_df_no_s = prediction_df_no_s.loc[(prediction_df_no_s['y_true'] == 0) & (prediction_df_no_s['y_pred'] == 1)]
+
+        scar_df = pd.read_excel(GlobalPaths.scar_location)
+        scar_df = scar_df[[col for col in scar_df.columns if 'Basal' in col or 'Apical' in col or 'Apex' in col] + ['Record_ID']]
+        scar_df.dropna(inplace=True)
+        fp_df_no_s = pd.merge(left=fp_df_no_s, right=scar_df, how="inner", on=["Record_ID"])
+
+
+
+        v = 9
+
+
         a = np.array(confusion_matrix(test_y, preds))
         conf_matrix_list.append(a)
-        # print(confusion_matrix(test_y, preds))
-        # print(classification_report(test_y, preds))
+        print(confusion_matrix(test_y, preds))
+        print(classification_report(test_y, preds))
     conf_all = np.zeros((2, 2))
     for conf in conf_matrix_list:
         conf_all = np.add(conf_all, conf)
     result = np.round(np.divide(conf_all, run))
     print(result)
-    v = 9
 
 
 if __name__ == '__main__':
+    scar_df = pd.read_excel(GlobalPaths.scar_location)
+    scar_df = scar_df[
+        [col for col in scar_df.columns if 'Basal' in col or 'Mid' in col or 'Apical' in col or 'Apex' in col] + ['Record_ID']]
+    scar_df.dropna(inplace=True)
+
+    extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                   ann_dir_path=GlobalPaths.pla_annotation,
+                                   metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                   verbose=True)
+    extracted_segments_dict = extractor.extract_segments()
+    ecg_feature_ds = get_ecg_feature_dataset(extracted_segments_dict)
+    ecg_feature_ds.to_excel('cached_ecg_feature_only_dataset.xlsx', index=False)
+
+    dataset = pd.merge(left=scar_df, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+
+    v = 9
+
     # predict_scar_grid_search_tree(region_name='Mid', select_top_features=True)
-    predict_scar_tree(region_name='Mid', select_top_features=True)
+    # predict_scar_tree(region_name='Mid', select_top_features=True, use_augmentation=False)
 
