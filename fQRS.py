@@ -4,6 +4,7 @@ import statistics
 import numpy as np
 import pandas as pd
 import scipy
+import collections
 import scipy.stats.mstats_basic
 from scipy import signal
 from random import shuffle
@@ -29,6 +30,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from math import sin, cos, radians
 from DataManagement import EHRFeatureSelection
+from heapq import nsmallest
+from imblearn.over_sampling import SMOTENC, ADASYN
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.model_selection import train_test_split
+from statsmodels.stats.multitest import multipletests
 
 import tensorflow
 from tensorflow import keras
@@ -969,6 +975,655 @@ def process_website_ecg_for_ml():
     #         f = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
 
 
+# Returns a DataFrame with 'Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'.
+def get_scar_location_dataset() -> pd.DataFrame:
+    scar_columns = ['Record_ID', 'HCM type', 'Basal A', 'Basal S', 'Basal I', 'Basal L', 'Mid A', 'Mid S', 'Mid I',
+                    'Mid L', 'Apical A', 'Apical S', 'Apical I', 'Apical L', 'Apex']
+    scar_loc_df = pd.read_excel(GlobalPaths.scar_location)[scar_columns]
+    scar_loc_df = scar_loc_df[scar_loc_df[scar_columns[2]].notna()]
+
+    # hypertrophy_df = scar_loc_df[['Record_ID', 'HCM type']]
+    basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID']]
+    mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID']]
+    apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID']]
+    apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID']]
+
+    scar_loc_4_areas = []
+    for _, row in scar_loc_df.iterrows():
+        pid = row['Record_ID']
+        basal = int(any(basal_df.loc[basal_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+        mid = int(any(mid_df.loc[mid_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+        apical = int(any(apical_df.loc[apical_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+        apex = int(any(apex_df.loc[apex_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
+        new_row = [pid, basal, mid, apical, apex]
+        scar_loc_4_areas.append(new_row)
+
+    return pd.DataFrame(data=scar_loc_4_areas, columns=['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'])
+
+
+def get_ecg_feature_dataset(extracted_segments_dict: dict) -> pd.DataFrame:
+    pids = list(extracted_segments_dict.keys())
+
+    ecg_feature_ds = []
+    ecg_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy',
+                    'non_terminal_notches', 'terminal_notches', 'QRS_prominence', 'non_terminal_prominence',
+                    'terminal_prominence',
+                    'T', 't_prominence', 't_duration', 't_energy',
+                    'st_slope', 'st_slope_max', 'st_slope_min', 'st_rvalue',
+                    'non_terminal_has_crossed', 'terminal_has_crossed']
+
+    count = 0
+    for pid in pids:
+        patient_feature_vector = []
+        for lead_index in range(12):
+            # if pid != 10347 or lead_index != 7:
+            #     continue
+            lead_feature_vector = []
+            feature_dict = extract_features(extracted_segments_dict, pid=pid, lead_index=lead_index)
+            for feature in ecg_features:
+                lead_feature_vector.append(feature_dict[feature])
+            patient_feature_vector.extend(lead_feature_vector)
+        patient_feature_vector.insert(0, pid)
+        ecg_feature_ds.append(patient_feature_vector)
+        count += 1
+        if count % 10 == 0:
+            print(f'{count}/{len(pids)} subjects processed')
+        v = 9
+
+    ecg_columns = ['Record_ID']
+    for lead_index in range(12):
+        lead_name = Util.get_lead_name(lead_index)
+        for feature in ecg_features:
+            col_name = '(' + lead_name + ')' + feature
+            ecg_columns.append(col_name)
+    return pd.DataFrame(data=ecg_feature_ds, columns=ecg_columns)
+
+
+def get_ecg_scar_dataset(region_name: str, select_top_features: bool = True) -> (pd.DataFrame, [str], [str]):
+    try:
+        dataset = pd.read_excel('cached_dataset.xlsx')
+    except FileNotFoundError:
+        scar_location_ds = get_scar_location_dataset()  # 'Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'
+        scar_location_ds.dropna(inplace=True)
+
+        extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                       ann_dir_path=GlobalPaths.pla_annotation,
+                                       metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                       verbose=True)
+        extracted_segments_dict = extractor.extract_segments()
+        ecg_feature_ds = get_ecg_feature_dataset(extracted_segments_dict)
+
+        dataset = pd.merge(left=scar_location_ds, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        dataset.dropna(inplace=True)
+
+        dataset.to_excel('cached_dataset.xlsx', index=False)
+
+    discrete_features = ['non_terminal_notches', 'terminal_notches', 'non_terminal_has_crossed', 'terminal_has_crossed']
+    continuous_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy', 'QRS_prominence', 'non_terminal_prominence',
+                           'terminal_prominence', 'T', 't_prominence', 't_duration', 't_energy', 'st_slope',
+                           'st_slope_max', 'st_slope_min', 'st_rvalue']
+    if select_top_features:
+        other_regions_set = {'Basal', 'Mid', 'Apical', 'Apex'}.difference({region_name})
+        # selected_features = get_top_features(dataset=dataset,
+        #                                      discrete_features=discrete_features,
+        #                                      continuous_features=continuous_features,
+        #                                      region_name=region_name, other_regions_set=other_regions_set)
+        selected_features = get_top_features_all_ttest(dataset=dataset, region_name=region_name, other_regions_set=other_regions_set)
+        dataset = dataset[[col for col in dataset.columns if col in selected_features] + ['Record_ID', region_name]]
+    else:
+        dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', region_name]]
+
+    continuous_columns = [col for col in dataset.columns if col not in {'Record_ID', region_name} and col.split(')')[1] in continuous_features]
+    discrete_columns = [col for col in dataset.columns if col not in {'Record_ID', region_name} and col.split(')')[1] in discrete_features]
+    dataset = dataset[continuous_columns + discrete_columns + ['Record_ID', region_name]]
+    return dataset, continuous_columns, discrete_columns
+
+
+def generate_augmented_ecg_ds():
+    scar_location_ds = get_scar_location_dataset()  # 'Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'
+    scar_pids = set(scar_location_ds['Record_ID'].values)
+
+    extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                   ann_dir_path=GlobalPaths.pla_annotation,
+                                   metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                   verbose=True)
+    extracted_segments_dict = extractor.extract_segments()
+    ecg_pids = list(extracted_segments_dict.keys())
+
+    ecg_meta_augmented = []
+    scar_location_augmented_ds = []
+    for ecg_pid in ecg_pids:
+        if ecg_pid in scar_pids:
+            # Step 1: Generate VCG-augmented ECGs.
+            ecg = extracted_segments_dict[ecg_pid]['ecg_denoised']
+            ecg_augmented_1 = vcg_augmentation(np.transpose(ecg.values))
+            ecg_augmented_2 = vcg_augmentation(np.transpose(ecg.values))
+            ecg_augmented_3 = vcg_augmentation(np.transpose(ecg.values))
+
+            # Step 2: Store scar info for the new augmented ECGs.
+            new_ecg_pid = ecg_pid * 1000
+            basal = scar_location_ds.loc[scar_location_ds['Record_ID'] == ecg_pid]['Basal'].values[0]
+            mid = scar_location_ds.loc[scar_location_ds['Record_ID'] == ecg_pid]['Mid'].values[0]
+            apical = scar_location_ds.loc[scar_location_ds['Record_ID'] == ecg_pid]['Apical'].values[0]
+            apex = scar_location_ds.loc[scar_location_ds['Record_ID'] == ecg_pid]['Apex'].values[0]
+            scar_location_augmented_ds.append([new_ecg_pid + 1, basal, mid, apical, apex])
+            scar_location_augmented_ds.append([new_ecg_pid + 2, basal, mid, apical, apex])
+            scar_location_augmented_ds.append([new_ecg_pid + 3, basal, mid, apical, apex])
+
+            # Step 3: Write augmented ECGs into Data/ECG/ScarECG/Augmented and store ECG metadata.
+            new_ecg_id = extracted_segments_dict[ecg_pid]['ecg_id'] * 1000
+            frequency = extracted_segments_dict[ecg_pid]['frequency']
+            ecg_augmented_1.to_csv(f'Data/ECG/ScarECG/Augmented/{new_ecg_id + 1}.csv', index=False)
+            ecg_meta_augmented.append([new_ecg_id + 1, new_ecg_pid + 1, frequency])
+            ecg_augmented_2.to_csv(f'Data/ECG/ScarECG/Augmented/{new_ecg_id + 2}.csv', index=False)
+            ecg_meta_augmented.append([new_ecg_id + 2, new_ecg_pid + 2, frequency])
+            ecg_augmented_3.to_csv(f'Data/ECG/ScarECG/Augmented/{new_ecg_id + 3}.csv', index=False)
+            ecg_meta_augmented.append([new_ecg_id + 3, new_ecg_pid + 3, frequency])
+
+    pd.DataFrame(ecg_meta_augmented, columns=['ECG ID', 'Record_ID', 'Sample Base']).to_csv(
+        'Data/ECG/ScarECG/Augmented/scar_ecg_augmented_meta.csv', index=False)
+    pd.DataFrame(ecg_meta_augmented, columns=['ECG ID', 'Record_ID', 'Sample Base']).to_excel(
+        'Data/ECG/ScarECG/Augmented/scar_ecg_augmented_meta.xlsx', index=False)
+    pd.DataFrame(scar_location_augmented_ds, columns=['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']).to_excel(
+        'Data/ECG/ScarECG/Augmented/scar_location_augmented.xlsx', index=False)
+    print('ECG augmentation done!')
+
+
+models = {'LogisticRegression': LogisticRegression(solver='lbfgs', multi_class='ovr'),
+              'SVM': svm.LinearSVC(),
+              'RF': RandomForestClassifier(n_estimators=100, max_depth=5, class_weight=None, criterion='log_loss'),
+              'XGB': xgb.XGBClassifier(objective="binary:logistic",
+                                       colsample_bytree=1,
+                                       gamma=0.25,
+                                       learning_rate=0.1,
+                                       max_depth=5,
+                                       reg_lambda=10,
+                                       scale_pos_weight=1,
+                                       subsample=0.8),
+              'MLP': MLPClassifier(alpha=1e-3, hidden_layer_sizes=(130,))}
+
+
+def augment_smote(X: np.ndarray, y: np.ndarray, last_continuous_index: int):
+    # Augments dataset following SMOTE-NC approach.
+    # Assumption 1: All features are normalized.
+    # Assumption 2: Continuous features are placed at [0 ... last_continuous_index].
+
+    # Step 0: Check assumptions.
+    # for i in range(last_continuous_index+1):
+    #     if len(set(X[:, i])) == 2:
+    #         raise AssertionError(f'Feature at column {i} is not continuous')
+
+    # print(f'Augmenting dataset: {collections.Counter(y)}')
+    categorical_features = list(range(last_continuous_index+1, X.shape[1]))
+    sm = SMOTENC(categorical_features=categorical_features)
+    # sm = ADASYN()
+    X_res, y_res = sm.fit_resample(X, y)
+    # print('Done!')
+    return X_res, y_res
+
+
+def predict_scar_smote(region_name: str, select_top_features: bool = False):
+    try:
+        dataset = pd.read_excel('cached_dataset.xlsx')
+    except FileNotFoundError:
+        scar_location_ds = get_scar_location_dataset()  # 'Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'
+        scar_location_ds.dropna(inplace=True)
+
+        extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                       ann_dir_path=GlobalPaths.pla_annotation,
+                                       metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                       verbose=True)
+        extracted_segments_dict = extractor.extract_segments()
+        ecg_feature_ds = get_ecg_feature_dataset(extracted_segments_dict)
+
+        dataset = pd.merge(left=scar_location_ds, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        dataset.dropna(inplace=True)
+
+        dataset.to_excel('cached_dataset.xlsx', index=False)
+
+    discrete_features = ['non_terminal_notches', 'terminal_notches', 'non_terminal_has_crossed', 'terminal_has_crossed']
+    continuous_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy', 'QRS_prominence', 'non_terminal_prominence',
+                           'terminal_prominence', 'T', 't_prominence', 't_duration', 't_energy', 'st_slope',
+                           'st_slope_max', 'st_slope_min', 'st_rvalue']
+    if select_top_features:
+        other_regions_set = {'Basal', 'Mid', 'Apical', 'Apex'}.difference({region_name})
+        # selected_features = get_top_features(dataset=dataset,
+        #                                      discrete_features=discrete_features,
+        #                                      continuous_features=continuous_features,
+        #                                      region_name=region_name, other_regions_set=other_regions_set)
+        selected_features = get_top_features_all_ttest(dataset=dataset, region_name=region_name, other_regions_set=other_regions_set)
+        dataset = dataset[[col for col in dataset.columns if col in selected_features] + ['Record_ID', region_name]]
+    else:
+        dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', region_name]]
+
+    continuous_columns = [col for col in dataset.columns if col not in {'Record_ID', region_name} and col.split(')')[1] in continuous_features]
+    discrete_columns = [col for col in dataset.columns if col not in {'Record_ID', region_name} and col.split(')')[1] in discrete_features]
+    dataset = dataset[continuous_columns + discrete_columns + ['Record_ID', region_name]]
+
+    # Check if `dataset` is well organized.
+    if '_' in dataset.columns.values[-1]:
+        raise AssertionError(f'"{dataset.columns.values[-1]}" is not a valid region name')
+    if dataset.columns.values[-2] != 'Record_ID':
+        raise AssertionError('Column -2 must be "Record_ID"')
+
+    run = 5
+    acc_runs, f1_runs, auc_runs = [], [], []
+    for model_name in models:
+        model = models[model_name]
+        print(f'\n--- Model = {model_name} (testing for {run} times) ---')
+        for _ in range(run):
+            acc_folds, f1_folds, auc_folds = [], [], []
+            kf = KFold(n_splits=10, shuffle=True, random_state=123)
+            for split in kf.split(dataset):
+                train = dataset.iloc[split[0]]
+                test = dataset.iloc[split[1]]
+
+                train_x, train_y = train.iloc[:, 0:-2], train.iloc[:, -1].values
+                test_x, test_y = test.iloc[:, 0:-2], test.iloc[:, -1].values
+
+                train_x_continuous = train_x[continuous_columns + [col for col in discrete_columns if '_has_' not in col]]
+                # train_x_continuous = train_x[continuous_columns]
+
+                train_x_categorical = train_x[[col for col in discrete_columns if '_has_' in col]]
+                # train_x_categorical = train_x[discrete_columns]
+
+                test_x_continuous = test_x[continuous_columns + [col for col in discrete_columns if '_has_' not in col]]
+                # test_x_continuous = test_x[continuous_columns]
+
+                test_x_categorical = test_x[[col for col in discrete_columns if '_has_' in col]]
+                # test_x_categorical = test_x[discrete_columns]
+
+                scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
+                train_x = np.concatenate((scaler.fit_transform(train_x_continuous.values), train_x_categorical.values),
+                                         axis=1)
+                test_x = np.concatenate((scaler.transform(test_x_continuous.values), test_x_categorical.values),
+                                        axis=1)
+
+                # train_x_augmented, train_y_augmented = augment_smote(X=train_x, y=train_y, last_continuous_index=train_x_continuous.shape[1] - 1)
+                # train_x = np.concatenate((train_x, train_x_augmented), axis=0)
+                # train_y = np.concatenate((train_y, train_y_augmented), axis=0)
+                # print(f'Final trainset: {collections.Counter(train_y)}')
+                # print(f'Final testset: {collections.Counter(test_y)}')
+
+
+                model.fit(train_x, train_y)
+                preds = model.predict(test_x)
+
+                acc = accuracy_score(test_y, preds)
+                f1 = f1_score(test_y, preds)
+                auc = roc_auc_score(test_y, preds)
+                acc_folds.append(acc)
+                f1_folds.append(f1)
+                auc_folds.append(auc)
+            acc_runs.append(statistics.mean(acc_folds))
+            f1_runs.append(statistics.mean(f1_folds))
+            auc_runs.append(statistics.mean(auc_folds))
+        print(f'Accuracy = {round(statistics.mean(acc_runs) * 100, 2)}% ± {round(statistics.stdev(acc_runs) * 100, 2)}%')
+        print(f'F1 = {round(statistics.mean(f1_runs) * 100, 2)}% ± {round(statistics.stdev(f1_runs) * 100, 2)}%')
+        print(f'AUC = {round(statistics.mean(auc_runs) * 100, 2)}% ± {round(statistics.stdev(auc_runs) * 100, 2)}%')
+
+
+def predict_scar_grid_search_rf(region_name: str, select_top_features: bool = False):
+    dataset, continuous_columns, discrete_columns = get_ecg_scar_dataset(region_name=region_name, select_top_features=select_top_features)
+
+    # Check if `dataset` is well organized.
+    if '_' in dataset.columns.values[-1]:
+        raise AssertionError(f'"{dataset.columns.values[-1]}" is not a valid region name')
+    if dataset.columns.values[-2] != 'Record_ID':
+        raise AssertionError('Column -2 must be "Record_ID"')
+
+    # Phase 1: GridSearch for hyper-tuning RandomForestClassifier.
+    param_grid = {
+        "n_estimators": [50, 75, 100, 150, 200],
+        "criterion": ['gini', 'entropy', 'log_loss'],
+        "class_weight": [None, 'balanced', 'balanced_subsample'],
+        "max_depth": [None, 3, 5, 7, 10],
+        "n_jobs": [-1],
+    }
+    cl = RandomForestClassifier()
+    grid_cv = GridSearchCV(cl, param_grid, n_jobs=-1, scoring='f1', cv=5, verbose=1)
+    _ = grid_cv.fit(X=dataset.iloc[:, 0:-2].values, y=dataset.iloc[:, -1].values)
+    print(f'GridSearch Best Score = {grid_cv.best_score_}')
+    print(f'For Parameters:\n{grid_cv.best_params_}')
+
+    model = grid_cv.best_estimator_
+
+    # model.fit(dataset.iloc[:, 0:-2].values, dataset.iloc[:, -1].values)
+    preds = model.predict(dataset.iloc[:, 0:-2].values)
+    y_true = dataset.iloc[:, -1].values
+    acc = accuracy_score(y_true, preds)
+    f1 = f1_score(y_true, preds)
+    auc = roc_auc_score(y_true, preds)
+    print(acc, f1, auc)
+
+    # model = RandomForestClassifier(n_estimators=75, max_depth=None, class_weight='balanced_subsample', criterion='gini')
+    # run = 5
+    # acc_runs, f1_runs, auc_runs = [], [], []
+    # for _ in range(run):
+    #     acc_folds, f1_folds, auc_folds = [], [], []
+    #     kf = KFold(n_splits=5, shuffle=True)
+    #     for split in kf.split(dataset):
+    #         train = dataset.iloc[split[0]]
+    #         test = dataset.iloc[split[1]]
+    #
+    #         train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
+    #         test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+    #
+    #         model.fit(train_x, train_y)
+    #         preds = model.predict(test_x)
+    #
+    #         acc = accuracy_score(test_y, preds)
+    #         f1 = f1_score(test_y, preds)
+    #         auc = roc_auc_score(test_y, preds)
+    #         acc_folds.append(acc)
+    #         f1_folds.append(f1)
+    #         auc_folds.append(auc)
+    #     acc_runs.append(statistics.mean(acc_folds))
+    #     f1_runs.append(statistics.mean(f1_folds))
+    #     auc_runs.append(statistics.mean(auc_folds))
+    # print(f'Accuracy = {round(statistics.mean(acc_runs) * 100, 2)}% ± {round(statistics.stdev(acc_runs) * 100, 2)}%')
+    # print(f'F1 = {round(statistics.mean(f1_runs) * 100, 2)}% ± {round(statistics.stdev(f1_runs) * 100, 2)}%')
+    # print(f'AUC = {round(statistics.mean(auc_runs) * 100, 2)}% ± {round(statistics.stdev(auc_runs) * 100, 2)}%')
+
+
+def predict_scar_grid_search_xgb(region_name: str, select_top_features: bool = False):
+    dataset, continuous_columns, discrete_columns = get_ecg_scar_dataset(region_name=region_name, select_top_features=select_top_features)
+    # Check if `dataset` is well organized.
+    if '_' in dataset.columns.values[-1]:
+        raise AssertionError(f'"{dataset.columns.values[-1]}" is not a valid region name')
+    if dataset.columns.values[-2] != 'Record_ID':
+        raise AssertionError('Column -2 must be "Record_ID"')
+
+    param_grid = {
+        "max_depth": [3, 4, 5, 7],
+        "learning_rate": [0.01, 0.05, 0.1, 0.3],
+        "gamma": [0, 0.25, 1, 3],
+        "reg_lambda": [0, 1, 10, 30],
+        "scale_pos_weight": [1, 3, 5],
+        "subsample": [0.5, 0.8, 1],
+        "colsample_bytree": [0.3, 0.5, 0.8, 1],
+    }
+    acc_runs, f1_runs, auc_runs = [], [], []
+    for run in range(10):
+        print(f'\n--- Run {run+1} ---')
+        train_x, test_x, train_y, test_y = train_test_split(dataset.iloc[:, 0:-2].values,
+                                                            dataset.iloc[:, -1].values,
+                                                            test_size=0.33,
+                                                            shuffle=True)
+
+        xgb_cl = xgb.XGBClassifier(objective="binary:logistic")
+        grid_cv = GridSearchCV(xgb_cl, param_grid, n_jobs=-1, scoring='f1', cv=5, verbose=1)
+        _ = grid_cv.fit(X=train_x, y=train_y)
+        print(f'GridSearch Best Score = {grid_cv.best_score_}')
+        print(f'For Parameters:\n{grid_cv.best_params_}')
+
+        model = grid_cv.best_estimator_
+        preds = model.predict(test_x)
+        acc_runs.append(accuracy_score(test_y, preds))
+        f1_runs.append(f1_score(test_y, preds))
+        auc_runs.append(roc_auc_score(test_y, preds))
+        print(f'Accuracy = {round(statistics.mean(acc_runs) * 100, 2)}% ± {round(statistics.stdev(acc_runs) * 100, 2)}%')
+        print(f'F1 = {round(statistics.mean(f1_runs) * 100, 2)}% ± {round(statistics.stdev(f1_runs) * 100, 2)}%')
+        print(f'AUC = {round(statistics.mean(auc_runs) * 100, 2)}% ± {round(statistics.stdev(auc_runs) * 100, 2)}%')
+
+
+    # Phase 1: GridSearch for hyper-tuning XGBoostClassifier.
+
+    # xgb_cl = xgb.XGBClassifier(objective="binary:logistic")
+    # grid_cv = GridSearchCV(xgb_cl, param_grid, n_jobs=-1, scoring='f1', cv=3, verbose=1)
+    # _ = grid_cv.fit(X=dataset.iloc[:, 0:-2].values, y=dataset.iloc[:, -1].values)
+    # print(f'GridSearch Best Score = {grid_cv.best_score_}')
+    # print(f'For Parameters:\n{grid_cv.best_params_}')
+    #
+    # model = grid_cv.best_estimator_
+    # preds = model.predict(dataset.iloc[:, 0:-2].values)
+    # y_true = dataset.iloc[:, -1].values
+
+
+
+
+
+    # run = 5
+    # acc_runs, f1_runs, auc_runs = [], [], []
+    # for _ in range(run):
+    #     acc_folds, f1_folds, auc_folds = [], [], []
+    #     kf = KFold(n_splits=5, shuffle=True)
+    #     for split in kf.split(dataset):
+    #         train = dataset.iloc[split[0]]
+    #         test = dataset.iloc[split[1]]
+    #
+    #         train_x, train_y = train.iloc[:, 0:-2].values, train.iloc[:, -1].values
+    #         test_x, test_y = test.iloc[:, 0:-2].values, test.iloc[:, -1].values
+    #
+    #         model.fit(train_x, train_y)
+    #         preds = model.predict(test_x)
+    #
+    #         acc = accuracy_score(test_y, preds)
+    #         f1 = f1_score(test_y, preds)
+    #         auc = roc_auc_score(test_y, preds)
+    #         acc_folds.append(acc)
+    #         f1_folds.append(f1)
+    #         auc_folds.append(auc)
+    #     acc_runs.append(statistics.mean(acc_folds))
+    #     f1_runs.append(statistics.mean(f1_folds))
+    #     auc_runs.append(statistics.mean(auc_folds))
+    # print(f'Accuracy = {round(statistics.mean(acc_runs) * 100, 2)}% ± {round(statistics.stdev(acc_runs) * 100, 2)}%')
+    # print(f'F1 = {round(statistics.mean(f1_runs) * 100, 2)}% ± {round(statistics.stdev(f1_runs) * 100, 2)}%')
+    # print(f'AUC = {round(statistics.mean(auc_runs) * 100, 2)}% ± {round(statistics.stdev(auc_runs) * 100, 2)}%')
+
+
+def get_top_features(dataset: pd.DataFrame, discrete_features: [str], continuous_features: [str], region_name: str, other_regions_set: set):
+    df = dataset[[col for col in dataset.columns if col not in other_regions_set]]
+    ttest_result = []
+    discrete_col_names = []
+    for col in df.columns:
+        if col not in ['Record_ID', region_name]:
+            feature_name = col.split(')')[1]
+            if feature_name in discrete_features:
+                discrete_col_names.append(col)
+            elif feature_name in continuous_features:
+                _, p_value = ttest_ind(a=df.loc[df[region_name] == 0][col].values,
+                                       b=df.loc[df[region_name] == 1][col].values,
+                                       equal_var=False)
+                ttest_result.append((col, p_value))
+            else:
+                raise AssertionError(f'Invalid feature {col}')
+    ttest_result = sorted(ttest_result, key=lambda item: item[1])
+    ttest_result = [x for x in ttest_result if x[1] < 0.05]
+
+    df_discrete = df[discrete_col_names]
+    mi = mutual_info_classif(X=df_discrete.values, y=df[region_name].values, discrete_features=True)
+    mi_result = list(zip(discrete_col_names, mi))
+    mi_result = sorted(mi_result, key=lambda item: item[1], reverse=True)
+    mi_result = [x for x in mi_result if x[1] > 0.001]
+    # EHRFeatureSelection.plot_feature_score(ttest_result, y_title='P-value', y_limit=0.05)
+    selected_features = [x[0] for x in ttest_result] #+ [x[0] for x in mi_result]
+    return selected_features
+
+
+def feature_multiple_comparison():
+    dataset = pd.read_excel('cached_dataset.xlsx')
+    result = []
+    for feature in dataset.columns:
+        if feature not in ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']:
+            uncorrected_pvalues = []
+            for region_name in ['Basal', 'Mid', 'Apical', 'Apex']:
+                _, p_value = ttest_ind(a=dataset.loc[dataset[region_name] == 0][feature].values,
+                                       b=dataset.loc[dataset[region_name] == 1][feature].values,
+                                       equal_var=False)
+                uncorrected_pvalues.append(p_value)
+            reject, pvals_corrected, _, _ = multipletests(pvals=uncorrected_pvalues, method='bonferroni')
+            result.append((feature, pvals_corrected))
+    result_sorted = sorted(result, key=lambda x: sum(x[1]))
+
+    result_sorted = result_sorted[:10]
+
+    labels = [x[0] for x in result_sorted]
+    basal_values = [x[1][0] for x in result_sorted]
+    mid_values = [x[1][1] for x in result_sorted]
+    apical_values = [x[1][2] for x in result_sorted]
+    apex_values = [x[1][3] for x in result_sorted]
+
+    x = np.arange(len(labels))  # the label locations
+    width = 0.35  # the width of the bars
+
+    fig, ax = plt.subplots(figsize=(15, 5))
+    rects1 = ax.bar(x - width / 2, basal_values, width, label='Basal')
+    rects2 = ax.bar(x + width / 2, mid_values, width, label='Mid')
+    rects3 = ax.bar(x + width / 2, apical_values, width, label='Apical')
+    rects4 = ax.bar(x + width / 2, apex_values, width, label='Apex')
+
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_ylabel('Corrected P-value')
+    ax.set_title('Feature Significance in each Region')
+    ax.set_xticks(x, labels)
+    ax.legend()
+
+    # ax.bar_label(rects1, padding=3)
+    # ax.bar_label(rects2, padding=3)
+    # ax.bar_label(rects3, padding=3)
+    # ax.bar_label(rects4, padding=3)
+
+    fig.tight_layout()
+
+    plt.show()
+    v = 9
+
+
+
+
+    for region_name in ['a', 'b', 'c', 'd']:
+        other_regions_set = set()
+        df = dataset[[col for col in dataset.columns if col not in other_regions_set]]
+
+
+def get_top_features_all_ttest(dataset: pd.DataFrame, region_name: str, other_regions_set: set):
+    df = dataset[[col for col in dataset.columns if col not in other_regions_set]]
+    ttest_result = []
+    for col in df.columns:
+        if col not in ['Record_ID', region_name]:
+            _, p_value = ttest_ind(a=df.loc[df[region_name] == 0][col].values,
+                                   b=df.loc[df[region_name] == 1][col].values,
+                                   equal_var=False)
+            ttest_result.append((col, p_value))
+    ttest_result = sorted(ttest_result, key=lambda item: item[1])
+    ttest_result = [x for x in ttest_result if x[1] < 0.05]
+
+    # EHRFeatureSelection.plot_feature_score(ttest_result, y_title='P-value', y_limit=0.05)
+    selected_features = [x[0] for x in ttest_result]
+    return selected_features
+
+
+def prepare_scar_ecg_dataset(augment: bool, augment_percent: float, region_name: str, select_top_features: bool = False):
+    other_regions_set = {'Basal', 'Mid', 'Apical', 'Apex'}.difference({region_name})
+    scar_location_ds = get_scar_location_dataset()  # 'Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'
+    scar_location_ds.dropna(inplace=True)
+
+    extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
+                                   ann_dir_path=GlobalPaths.pla_annotation,
+                                   metadata_path=GlobalPaths.cached_scar_ecg_meta,
+                                   verbose=True)
+    extracted_segments_dict = extractor.extract_segments()
+    ecg_feature_ds = get_ecg_feature_dataset(extracted_segments_dict)
+
+    dataset = pd.merge(left=scar_location_ds, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+
+    if select_top_features:
+        selected_features = get_top_features(dataset=dataset, region_name=region_name, other_regions_set=other_regions_set)
+
+
+
+    if augment:
+        scar_location_augmented_ds = pd.read_excel(GlobalPaths.scar_location_augmented)
+        extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg_augmented,
+                                       ann_dir_path=GlobalPaths.pla_annotation_augmented,
+                                       metadata_path=GlobalPaths.scar_ecg_augmented_meta,
+                                       verbose=True)
+        extracted_segments_dict = extractor.extract_segments()
+        ecg_augmented_feature_ds = get_ecg_feature_dataset(extracted_segments_dict)
+        dataset_augmented = pd.merge(left=scar_location_augmented_ds, right=ecg_augmented_feature_ds, how="inner", on=["Record_ID"])
+        augmented_pids = set(dataset_augmented['Record_ID'].values)
+
+    models = {'LogisticRegression': LogisticRegression(solver='lbfgs', multi_class='ovr'),
+              'SVM': svm.LinearSVC(),
+              'RF': RandomForestClassifier(n_estimators=100, max_depth=5),
+              'XGB': xgb.XGBClassifier(objective="binary:logistic",
+                                       colsample_bytree=1,
+                                       gamma=0.25,
+                                       learning_rate=0.1,
+                                       max_depth=5,
+                                       reg_lambda=10,
+                                       scale_pos_weight=1,
+                                       subsample=0.8),
+              'MLP': MLPClassifier(alpha=1e-3, hidden_layer_sizes=(130,))}
+
+    for model_name in models:
+        model = models[model_name]
+        print(f'\n--- Model = {model_name} ---\n')
+
+        acc_list = []
+        f1_list = []
+        auc_list = []
+        kf = KFold(n_splits=10, shuffle=True, random_state=123)
+        for split in kf.split(dataset):
+            train = dataset.iloc[split[0]]
+            test = dataset.iloc[split[1]]
+            if augment:
+                real_pids = list(set(train['Record_ID'].values))
+                selected_pids = random.sample(real_pids, round(len(real_pids) * augment_percent))
+                selected_augmented_ds = []
+                for pid in selected_pids:
+                    pid_augmented = pid * 1000 + random.randint(1, 3)
+                    if pid_augmented in augmented_pids:
+                        row = dataset_augmented.loc[dataset_augmented['Record_ID'] == pid_augmented].values[0]
+                        selected_augmented_ds.append(row)
+                selected_augmented_ds = pd.DataFrame(selected_augmented_ds, columns=dataset_augmented.columns)
+                train = pd.concat([train, selected_augmented_ds], ignore_index=True)
+                train = train.sample(frac=1).reset_index(drop=True)
+
+            if select_top_features:
+                train = train[[col for col in train.columns if col in selected_features] + ['Record_ID', region_name]]
+                test = test[[col for col in test.columns if col in selected_features] + ['Record_ID', region_name]]
+            else:
+                train = train[
+                    [col for col in train.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID',
+                                                                                                       region_name]]
+                test = test[
+                    [col for col in test.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID',
+                                                                                                      region_name]]
+
+            train_x, train_y = train.iloc[:, 0:-2], train.iloc[:, -1].values
+            test_x, test_y = test.iloc[:, 0:-2], test.iloc[:, -1].values
+
+            train_x_continuous = train_x[[col for col in train_x.columns if 'has_' not in col]]
+            train_x_categorical = train_x[[col for col in train_x.columns if 'has_' in col]]
+            test_x_continuous = test_x[[col for col in test_x.columns if 'has_' not in col]]
+            test_x_categorical = test_x[[col for col in test_x.columns if 'has_' in col]]
+
+            scaler = preprocessing.StandardScaler()
+            train_x = np.concatenate((scaler.fit_transform(train_x_continuous.values), train_x_categorical.values),
+                                     axis=1)
+            test_x = np.concatenate((scaler.transform(test_x_continuous.values), test_x_categorical.values),
+                                    axis=1)
+
+            model.fit(train_x, train_y)
+            preds = model.predict(test_x)
+            acc = accuracy_score(test_y, preds)
+            f1 = f1_score(test_y, preds)
+            auc = roc_auc_score(test_y, preds)
+            acc_list.append(acc)
+            f1_list.append(f1)
+            auc_list.append(auc)
+        print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
+        print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
+        print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
+
+
+
+
+
+
+
 def process_scar_ecg_for_ml():
     try:
         result = pd.read_csv('Data/ecg_feature_scar.csv')
@@ -977,29 +1632,7 @@ def process_scar_ecg_for_ml():
         predict_scar(dataset=result)
         # run_nn(result)
     except FileNotFoundError:
-        scar_columns = ['Record_ID', 'HCM type', 'Basal A', 'Basal S', 'Basal I', 'Basal L', 'Mid A', 'Mid S', 'Mid I',
-                        'Mid L', 'Apical A', 'Apical S', 'Apical I', 'Apical L', 'Apex']
-        scar_loc_df = pd.read_excel(GlobalPaths.scar_location)[scar_columns]
-        scar_loc_df = scar_loc_df[scar_loc_df[scar_columns[2]].notna()]
-
-        hypertrophy_df = scar_loc_df[['Record_ID', 'HCM type']]
-        basal_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Basal' in col] + ['Record_ID']]
-        mid_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Mid' in col] + ['Record_ID']]
-        apical_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apical' in col] + ['Record_ID']]
-        apex_df = scar_loc_df[[col for col in scar_loc_df.columns if 'Apex' in col] + ['Record_ID']]
-
-        scar_loc_4_areas = []
-        for _, row in scar_loc_df.iterrows():
-            pid = row['Record_ID']
-            basal = int(any(basal_df.loc[basal_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
-            mid = int(any(mid_df.loc[mid_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
-            apical = int(any(apical_df.loc[apical_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
-            apex = int(any(apex_df.loc[apex_df['Record_ID'] == pid].iloc[:, :-1].values[0]))
-            new_row = [pid, basal, mid, apical, apex]
-            scar_loc_4_areas.append(new_row)
-
-        scar_loc_4_areas = pd.DataFrame(data=scar_loc_4_areas, columns=['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex'])
-
+        scar_loc_4_areas = get_scar_location_dataset()
         # Prepare ECG feature dataset.
         extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg,
                                        ann_dir_path=GlobalPaths.pla_annotation,
@@ -1047,8 +1680,8 @@ def process_scar_ecg_for_ml():
         result_scar = pd.merge(left=scar_loc_4_areas, right=ecg_feature_ds, how="inner", on=["Record_ID"])
         result_scar.to_csv('Data/ecg_feature_scar.csv', index=False)
 
-        result_hypertrophy = pd.merge(left=hypertrophy_df, right=ecg_feature_ds, how="inner", on=["Record_ID"])
-        result_hypertrophy.to_csv('Data/ecg_feature_hypertrophy.csv', index=False)
+        # result_hypertrophy = pd.merge(left=hypertrophy_df, right=ecg_feature_ds, how="inner", on=["Record_ID"])
+        # result_hypertrophy.to_csv('Data/ecg_feature_hypertrophy.csv', index=False)
 
 
 def contain_leads(col_name: str, lead_names: [str]):
@@ -1120,7 +1753,7 @@ def predict_hypertrophy(dataset: pd.DataFrame):
 def predict_scar(dataset: pd.DataFrame):
     # Consider only features from leads II, aVF, V2, V6.
     # TODO: Maybe try other leads too. Or, increase/decrease the number of leads.
-    # dataset = dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
+    dataset = dataset[[col for col in dataset.columns if contain_leads(col, ['II', 'aVF', 'V2', 'V6'])] + ['Record_ID', 'Basal', 'Mid', 'Apical', 'Apex']]
     dataset.dropna(inplace=True)
 
     # Perform binary classification for each of the basal, mid, apical, and apex areas.
@@ -1143,12 +1776,7 @@ def predict_scar(dataset: pd.DataFrame):
     EHRFeatureSelection.plot_feature_score(ttest_result, y_title='P-value', y_limit=0.05)
 
     selected_features = [x[0] for x in ttest_result]
-    df = df[[col for col in df.columns if col in selected_features] + ['Record_ID', target_col]]
-
-    v = 9
-
-
-
+    # df = df[[col for col in df.columns if col in selected_features] + ['Record_ID', target_col]]
 
     # Phase 1: GridSearch for hyper-tuning XGBoostClassifier.
     # param_grid = {
@@ -1346,4 +1974,13 @@ if __name__ == '__main__':
     # process_website_ecgs()
     # process_t_waves()
     # process_website_ecg_for_ml()
-    process_scar_ecg_for_ml()
+    # process_scar_ecg_for_ml()
+    # generate_augmented_ecg_ds()
+    # prepare_scar_ecg_dataset(augment=False, augment_percent=1, region_name='Mid', select_top_features=False)
+    # predict_scar_smote(region_name='Mid', select_top_features=True)
+    # predict_scar_grid_search_rf(region_name='Mid', select_top_features=True)
+    # predict_scar_grid_search_xgb(region_name='Mid', select_top_features=True)
+    feature_multiple_comparison()
+    # TODO -> Run train_test_split with shuffle to leave-out a test set, then run gridSearchCV with kfold = 5 on the
+    #  train set to get the best_estimator, and then evaluate/predict the best_estimator using test set. Run the whole
+    #  thing 10 times.

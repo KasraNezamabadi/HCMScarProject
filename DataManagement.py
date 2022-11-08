@@ -890,7 +890,7 @@ class EHRFeatureSelection:
         score = [x[1] for x in feature_score_pair]
         x_pos = np.arange(len(features))
 
-        plt.figure(figsize=(20, 5))
+        plt.figure(figsize=(20, 10))
         plt.bar(x_pos, score, align='center')
         if y_limit is not None:
             plt.axhline(y=y_limit, color='r', linestyle='-')
