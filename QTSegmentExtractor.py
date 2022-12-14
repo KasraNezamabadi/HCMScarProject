@@ -1,4 +1,5 @@
 import os.path
+import random
 
 import pandas as pd
 import numpy as np
@@ -13,14 +14,21 @@ class QTSegmentExtractor:
         self.ann_dir_path = ann_dir_path
         self.metadata_path = metadata_path
 
-        self.ecg_ids, self.pids, self.frequency_list = Loader.metadata(metadata_path=metadata_path)
+        # self.ecg_ids, self.pids, self.frequency_list = Loader.metadata(metadata_path=metadata_path)
+        self.ecg_ids, self.pids, self.frequency_list = Loader.metadata(metadata_path=metadata_path,
+                                                                       ecg_id_name='ECG_ID',
+                                                                       pid_name='Record_ID',
+                                                                       frequency_name='Frequency')
         self.column_names = ['P Start', 'P End', 'QRS Start', 'QRS End', 'T Start', 'T End']
         # self.selected_leads = [1, 2, 5, 7]
         self.selected_leads = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         self.verbose = verbose
 
-    def extract_segments(self):
+    def extract_segments(self, debug: int = None):
         results = {}
+        print(f'Extracting QT segments from {len(self.ecg_ids)} ECGs ...')
+        count_successful = 0
+        count_unsuccessful = 0
         for i in range(len(self.ecg_ids)):
             ecg_id = self.ecg_ids[i]
             pid = self.pids[i]
@@ -28,12 +36,17 @@ class QTSegmentExtractor:
             segment_dict = self._parse_annotation(ecg_id=ecg_id, pid=pid, frequency=frequency)
 
             if pid in segment_dict:
-                p_results_dict = segment_dict[pid]
-                results[pid] = p_results_dict
+                count_successful += 1
+                segment_dict = segment_dict[pid]
+                if pid in results:
+                    results[pid].append(segment_dict)
+                else:
+                    results[pid] = [segment_dict]
             else:
-                print(f'Skipping {pid}')
-            if self.verbose and i != 0 and i % 50 == 0:
-                print(f'--- {round(i/len(self.ecg_ids) * 100)}% Done')
+                count_unsuccessful += 1
+            if debug is not None and i > debug:
+                break
+        print(f'   --- Done. {count_successful} ECGs successfully processed, {count_unsuccessful} ECGs were ignored.')
 
         return results
 

@@ -6,6 +6,8 @@ import struct
 import array
 import os
 
+import pandas as pd
+
 # Globals
 # The following are the element tags for the XML document
 # WAVEFORM_ELEM = "Waveform"
@@ -307,7 +309,7 @@ class MuseXmlParser:
         """This function writes the ZCG buffer to a CSV file. All 12 or 15 leads
         are generated."""
         std_Leads = set(INDEPENDENT_LEADS)
-        header = ("I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6")
+        header = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
         extra_Leads = std_Leads.symmetric_difference(set(self.ecg_Leads))
         # # print "EXTRA LEADS: ", extra_Leads
 
@@ -321,6 +323,69 @@ class MuseXmlParser:
                 if lead in extra_Leads:
                     fd.write("%s, " % lead)
             fd.write("\n")
+
+            samples = dict()
+
+            for i in range(0, len(self.zcg), len(self.ecg_Leads)):
+                # The values in the ZCG buffer are stored in the same order
+                # as the ecg leads are themselves...
+                k = 0
+                for lead in self.ecg_Leads:
+                    samples[lead] = self.zcg[i + k]
+                    k = k + 1
+                # Output each sample, calculated and uncalcuated
+                fd.write("%d, " % int(samples["I"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["II"] * self.adu_Gain))
+                # II - I = III
+                fd.write("%d, " % int((samples["II"] - samples["I"]) * self.adu_Gain))
+                # aVR = -(I + II)/2
+                fd.write("%d, " % int((-(samples["I"] + samples["II"]) / 2) * self.adu_Gain))
+                # aVL = I - II/2
+                fd.write("%d, " % int((samples["I"] - samples["II"] / 2) * self.adu_Gain))
+                # aVF = II - I/2
+                fd.write("%d, " % int((samples["II"] - samples["I"] / 2) * self.adu_Gain))
+                # output the precordial leads
+                fd.write("%d, " % int(samples["V1"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["V2"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["V3"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["V4"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["V5"] * self.adu_Gain))
+                fd.write("%d, " % int(samples["V6"] * self.adu_Gain))
+                # output any extra leads
+                for lead in self.ecg_Leads:
+                    if lead in extra_Leads:
+                        fd.write("%d, " % int(samples[lead] * self.adu_Gain))
+                fd.write("\n")
+        # print("\nCSV file (\"%s\") is generated, with %d columns of ECG signals" % (file_Name, len(header) + len(extra_Leads)))
+        # print("ECG sampling rate is %d Hz." % self.sample_Rate)
+        # print("ECG stored in units of %s." % self.units)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        header = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+        standard_leads = set(INDEPENDENT_LEADS)
+        extra_leads = standard_leads.symmetric_difference(set(self.ecg_Leads))
+
+        ecg = []
+        samples = dict()
+        for i in range(0, len(self.zcg), len(self.ecg_Leads)):
+            # The values in the ZCG buffer are stored in the same order as the ecg leads are themselves.
+            k = 0
+            for lead in self.ecg_Leads:
+                samples[lead] = self.zcg[i + k]
+                k = k + 1
+
+            int(samples["I"] * self.adu_Gain)
+
+        # fd = open(file_Name, 'wt')
+        # if fd:
+        #     # write the header information
+        #     for lead in header:
+        #         fd.write("%s, " % lead)
+        #     # write any extra leads
+        #     for lead in self.ecg_Leads:
+        #         if lead in extra_Leads:
+        #             fd.write("%s, " % lead)
+        #     fd.write("\n")
 
             samples = dict()
 

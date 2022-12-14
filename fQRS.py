@@ -1,3 +1,4 @@
+import math
 import random
 import statistics
 
@@ -35,6 +36,7 @@ from imblearn.over_sampling import SMOTENC, ADASYN
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.model_selection import train_test_split
 from statsmodels.stats.multitest import multipletests
+from scipy.stats import zscore
 
 import tensorflow
 from tensorflow import keras
@@ -757,17 +759,67 @@ def process_t_waves():
                 v = 9
 
 
-def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
-    ecg_id = extracted_segments_dict[pid]['ecg_id']
-    frequency = extracted_segments_dict[pid]['frequency']
+def parse_QRS_complex(qt_segment):
+    qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
+
+    # Sometimes the QRS segment is incorrectly identified: monotonically increasing or decreasing. Skip.
+    if (qrs_segment[0] == min(qrs_segment) and qrs_segment[-1] == max(qrs_segment)) or \
+            qrs_segment[-1] == min(qrs_segment) and qrs_segment[0] == max(qrs_segment):
+        raise AssertionError('Less than two QRS identified. Better to ignore this ECG.')
+
+    qt_segment_norm = normalize(segment=qt_segment)
+    qrs_segment_norm = qt_segment_norm[:round(len(qt_segment) / 3)]
+    qrs = identify_qrs_waves(qrs_segment_orig=qrs_segment, qrs_segment_norm=qrs_segment_norm)
+    qrs_offset = identify_qrs_offset(qrs_segment_norm, qrs)
+    return qrs, qrs_offset
+
+
+# def extract_features_from_qt_segment(qt_segment, frequency):
+#     qrs_segment = qt_segment[:round(len(qt_segment) / 3)]
+#     t_segment = qt_segment[round(len(qt_segment) / 3):]
+#
+#     # Normalize segments.
+#     qt_segment_norm = normalize(segment=qt_segment)
+#     qrs_segment_norm = qt_segment_norm[:round(len(qt_segment) / 3)]
+#     t_segment_norm = qt_segment_norm[round(len(qt_segment) / 3):]
+#
+#     # Sometimes the QRS segment is incorrectly identified: monotonically increasing or decreasing. Skip.
+#     if (qrs_segment[0] == min(qrs_segment) and qrs_segment[-1] == max(qrs_segment)) or \
+#             qrs_segment[-1] == min(qrs_segment) and qrs_segment[0] == max(qrs_segment):
+#         raise AssertionError('Less than two QRS identified. Better to ignore this ECG.')
+#
+#     try:
+#         qrs = identify_qrs_waves(qrs_segment_orig=qrs_segment, qrs_segment_norm=qrs_segment_norm)
+#         qrs_offset = identify_qrs_offset(qrs_segment_norm, qrs)
+#         if qrs_offset < 1:
+#             continue
+#         qrs.width = qrs_offset
+#         qrs.duration = round((1 / frequency) * qrs_offset, 4)
+#         # Calculate energy of signal: https://matel.p.lodz.pl/wee/i12zet/Signal%20energy%20and%20power.pdf
+#         qrs.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qrs_segment[:qrs_offset + 1]])
+#     except AssertionError:
+#         continue
+#
+#     try:
+#         t_waves, st_line, t_onset = find_t_peak(t_segment_norm=t_segment_norm, t_segment_orig=t_segment)
+#     except AssertionError:
+#         continue
+#     biphasic_wave = None
+#     if len(t_waves) > 1:
+#         biphasic_wave = t_waves[1]
+#     twave = Twave(segment_raw=t_segment, segment_norm=t_segment_norm, primary_wave=t_waves[0], st_line=st_line,
+#                   biphasic_wave=biphasic_wave, onset=t_onset)
+#     twave.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qt_segment[qrs_offset + 1:]])
+#
+#     lead_qrs_list.append(qrs)
+#     lead_t_list.append(twave)
+
+def extract_lead_features(lead_qt_segments: list, lead_index: int, frequency: int):
     lead_name = Util.get_lead_name(index=lead_index)
-    lead_qt_segments = [x[lead_index, :] for x in extracted_segments_dict[pid]['segments']]
 
     # Buffer vars for feature extraction from lead.
     lead_qrs_list = []
     lead_t_list = []
-    # lead_qrs_segment_norm = []
-    # lead_t_segment_norm = []
 
     # Each lead has several QT segments. Loop over all of them and identify QRS and T-wave in each.
     for qt_segment in lead_qt_segments:
@@ -793,9 +845,6 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
             qrs.duration = round((1 / frequency) * qrs_offset, 4)
             # Calculate energy of signal: https://matel.p.lodz.pl/wee/i12zet/Signal%20energy%20and%20power.pdf
             qrs.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qrs_segment[:qrs_offset + 1]])
-            # plot_qrs_waves(qrs)
-            # plt.show()
-            v = 9
         except AssertionError:
             continue
 
@@ -809,17 +858,6 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
         twave = Twave(segment_raw=t_segment, segment_norm=t_segment_norm, primary_wave=t_waves[0], st_line=st_line,
                       biphasic_wave=biphasic_wave, onset=t_onset)
         twave.energy = scipy.integrate.simpson(y=[abs(y) ** 2 for y in qt_segment[qrs_offset + 1:]])
-        # x = np.array(list(range(round(len(qt_segment) / 3), round(len(qt_segment) / 3) + 20)))
-        # figure(figsize=(3, 6), dpi=80)
-        # plt.plot(qt_segment)
-        # plt.scatter(x=twave.primary_wave.peak_index + t_offset, y=qt_segment[twave.primary_wave.peak_index + t_offset],
-        #             color='r')
-        # plt.scatter(x=twave.onset + t_offset, y=qt_segment[twave.onset + t_offset],
-        #             color='b')
-        # plt.plot(x, st_line.intercept + st_line.slope * x, 'r')
-        # plt.title(f'Slope={round(twave.st_line.slope, 3)}')
-        # plt.show()
-        v = 9
 
         lead_qrs_list.append(qrs)
         lead_t_list.append(twave)
@@ -829,6 +867,8 @@ def extract_features(extracted_segments_dict: dict, pid: int, lead_index: int):
                            'max_prominence': 0,
                            'T': 0, 'T2': False, 't_prominence': 0, 't_width': 0}
 
+    if len(lead_qrs_list) < 2:
+        raise AssertionError('Less than two QRS identified. Better to ignore this ECG.')
     # Step 1: Extract Q, R, and S amps and QRS prominence:
     # QRS prominence = max prominence among Q, R, and S.
     q_list = []
@@ -1006,6 +1046,156 @@ def get_scar_subregion(region_name: str) -> pd.DataFrame:
     scar_df = scar_df[[col for col in scar_df.columns if region_name in col] + ['Record_ID']]
     scar_df.dropna(inplace=True)
     return scar_df
+
+
+def get_ecg_feature_ds_uncertainty(extracted_segments_dict: dict) -> pd.DataFrame:
+    # pid = 10003 completely different shape in V1.
+    pids = list(extracted_segments_dict.keys())
+    ecg_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy',
+                    'non_terminal_notches', 'terminal_notches', 'QRS_prominence', 'non_terminal_prominence',
+                    'terminal_prominence',
+                    'T', 't_prominence', 't_duration', 't_energy',
+                    'st_slope', 'st_slope_max', 'st_slope_min', 'st_rvalue',
+                    'non_terminal_has_crossed', 'terminal_has_crossed']
+
+    ecg_columns = ['Record_ID', 'ECG_ID']
+    for lead_index in range(12):
+        lead_name = Util.get_lead_name(lead_index)
+        for feature in ecg_features:
+            col_name = '(' + lead_name + ')' + feature
+            ecg_columns.append(col_name)
+
+    dataset = pd.DataFrame()
+    count = 0
+    print(f'\nExtracting ECG Features from {len(pids)} patients ...')
+    for pid in pids:
+        patient_ecg_feature_df = []
+        batch_ecg = extracted_segments_dict[pid]
+        for ecg_dict in batch_ecg:
+            fig, ax = plt.subplots(nrows=12, ncols=1, figsize=(15, 20))
+            ecg_id = ecg_dict['ecg_id']
+            fig.suptitle(f'PID={pid} | ECG={ecg_id}', fontsize=16)
+            for lead_index in range(12):
+                ax[lead_index].plot(ecg_dict['ecg_denoised'][Util.get_lead_name(lead_index)].values)
+                ax[lead_index].title.set_text(Util.get_lead_name(lead_index))
+            plt.axis('off')
+            plt.show()
+            v = 9
+
+        select_lead_index = 6
+        ecgs_to_show = []
+        for ecg_dict in batch_ecg:
+            ecg_12_lead_feature_vector = []
+            frequency = ecg_dict['frequency']
+
+            try:
+                for lead_index in range(12):
+                    lead_qt_segments = [x[lead_index, :] for x in ecg_dict['segments']]
+                    lead_feature_dict = extract_lead_features(lead_qt_segments, lead_index, frequency)
+                    lead_feature_vector = []
+                    for feature in ecg_features:
+                        lead_feature_vector.append(lead_feature_dict[feature])
+                    ecg_12_lead_feature_vector.extend(lead_feature_vector)
+                    if lead_index == select_lead_index:
+                        ecgs_to_show.append(ecg_dict['ecg_denoised'][Util.get_lead_name(lead_index)].values)
+            except AssertionError:
+                print(f'Skipping ECG {ecg_dict["ecg_id"]}')
+                continue
+
+            row = [pid, ecg_dict['ecg_id']] + ecg_12_lead_feature_vector
+            patient_ecg_feature_df.append(row)
+        patient_ecg_feature_df = pd.DataFrame(data=patient_ecg_feature_df, columns=ecg_columns)
+        columns = patient_ecg_feature_df.columns.values
+        for col in columns:
+            if col != 'Record_ID' and col != 'ECG_ID':
+                features = list(patient_ecg_feature_df[col].values)
+                if 'has_crossed' in col or '_notches' in col:  # These features are binary/ordinal (e.g., notch count).
+                    conf_column = [Counter(features)[item] / len(features) for item in features]
+                else:  # These are continuous features.
+                    if len(features) == 1:
+                        conf_column = [0]
+                    else:
+                        conf_column = [abs(x - statistics.mean(features)) for x in features]
+                    # conf_column = zscore(features)
+                    # conf_column = [0 if math.isnan(x) else x for x in conf_column]
+                conf_column_header = f'{col}[conf]'
+                index_to_insert = list(patient_ecg_feature_df.columns.values).index(col) + 1
+                patient_ecg_feature_df.insert(loc=index_to_insert, column=conf_column_header, value=conf_column)
+
+        ecg_count_column = [patient_ecg_feature_df.shape[0]] * patient_ecg_feature_df.shape[0]
+        patient_ecg_feature_df['ECG_Count'] = ecg_count_column
+        dataset = pd.concat([dataset, patient_ecg_feature_df], ignore_index=True)
+        count += 1
+        print(f'   --- {count}/{len(pids)} processed')
+    return dataset
+
+        # fig, ax = plt.subplots(nrows=len(ecgs_to_show), ncols=1, figsize=(15, 10))
+        # if len(ecgs_to_show) > 1:
+        #     for i in range(len(ecgs_to_show)):
+        #         ax[i].plot(ecgs_to_show[i])
+        #         snr = abs(float(signal_to_noise(ecgs_to_show[i])))
+        #         ax[i].title.set_text(f'SNR = {round(snr, 5)}')
+        # else:
+        #     ax.plot(ecgs_to_show[0])
+        #     snr = abs(float(signal_to_noise(ecgs_to_show[0])))
+        #     ax.title.set_text(f'SNR = {round(snr, 5)}')
+        # plt.show()
+
+
+def signal_to_noise(a, axis=0, ddof=0):
+    a = np.asanyarray(a)
+    m = a.mean(axis)
+    sd = a.std(axis=axis, ddof=ddof)
+    return np.where(sd == 0, 0, m/sd)
+
+
+def get_ecg_feature_dataset_several_visit(extracted_segments_dict: dict) -> pd.DataFrame:
+    pids = list(extracted_segments_dict.keys())
+    ecg_features = ['Q', 'R', 'S', 'QRS_duration', 'QRS_energy',
+                    'non_terminal_notches', 'terminal_notches', 'QRS_prominence', 'non_terminal_prominence',
+                    'terminal_prominence',
+                    'T', 't_prominence', 't_duration', 't_energy',
+                    'st_slope', 'st_slope_max', 'st_slope_min', 'st_rvalue',
+                    'non_terminal_has_crossed', 'terminal_has_crossed']
+
+    print(f'Extracting ECG features from {len(pids)} patients ...')
+    count = 0
+    ecg_feature_ds = []
+    for pid in pids:
+        for ecg_dict in extracted_segments_dict[pid]:
+            ecg_12_lead_feature_vector = []
+            frequency = ecg_dict['frequency']
+            try:
+                for lead_index in range(12):
+                    lead_qt_segments = [x[lead_index, :] for x in ecg_dict['segments']]
+                    lead_feature_dict = extract_lead_features(lead_qt_segments, lead_index, frequency)
+                    lead_feature_vector = []
+                    for feature in ecg_features:
+                        lead_feature_vector.append(lead_feature_dict[feature])
+                    ecg_12_lead_feature_vector.extend(lead_feature_vector)
+                    lead_signal = ecg_dict['ecg_denoised'][Util.get_lead_name(lead_index)].values
+                    # plt.figure(figsize=(15, 5))
+                    # plt.plot(lead_signal)
+                    # plt.show()
+                    # v = 9
+            except AssertionError:
+                print(f'Skipping ECG {ecg_dict["ecg_id"]}')
+                continue
+
+            row = [pid, ecg_dict['ecg_id']] + ecg_12_lead_feature_vector
+            ecg_feature_ds.append(row)
+            count += 1
+            if count % 20 == 0:
+                print(f'   --- {count} ECGs processed')
+
+    ecg_columns = ['Record_ID', 'ECG_ID']
+    for lead_index in range(12):
+        lead_name = Util.get_lead_name(lead_index)
+        for feature in ecg_features:
+            col_name = '(' + lead_name + ')' + feature
+            ecg_columns.append(col_name)
+    print(f'Done!')
+    return pd.DataFrame(data=ecg_feature_ds, columns=ecg_columns)
 
 
 def get_ecg_feature_dataset(extracted_segments_dict: dict) -> pd.DataFrame:
@@ -1466,22 +1656,24 @@ def feature_multiple_comparison():
     result_sorted = result_sorted[:10]
 
     labels = [x[0] for x in result_sorted]
-    basal_values = [x[1][0] for x in result_sorted]
-    mid_values = [x[1][1] for x in result_sorted]
-    apical_values = [x[1][2] for x in result_sorted]
-    apex_values = [x[1][3] for x in result_sorted]
+    basal_values = [-1 * math.log10(x[1][0]) for x in result_sorted]
+    mid_values = [-1 * math.log10(x[1][1])for x in result_sorted]
+    apical_values = [-1 * math.log10(x[1][2]) for x in result_sorted]
+    apex_values = [-1 * math.log10(x[1][3]) for x in result_sorted]
 
     x = np.arange(len(labels))  # the label locations
-    width = 0.35  # the width of the bars
+    width = 0.15  # the width of the bars
 
     fig, ax = plt.subplots(figsize=(15, 5))
-    rects1 = ax.bar(x - width / 2, basal_values, width, label='Basal')
-    rects2 = ax.bar(x + width / 2, mid_values, width, label='Mid')
-    rects3 = ax.bar(x + width / 2, apical_values, width, label='Apical')
-    rects4 = ax.bar(x + width / 2, apex_values, width, label='Apex')
+    rects1 = ax.bar(x - 2*width, basal_values, width, label='Basal')
+    rects2 = ax.bar(x - width, mid_values, width, label='Mid')
+    rects3 = ax.bar(x + 0, apical_values, width, label='Apical')
+    rects4 = ax.bar(x + width, apex_values, width, label='Apex')
+
+    ax.axhline(y=1.3, color='r', linestyle='-')
 
     # Add some text for labels, title and custom x-axis tick labels, etc.
-    ax.set_ylabel('Corrected P-value')
+    ax.set_ylabel('Corrected -log(P-value)')
     ax.set_title('Feature Significance in each Region')
     ax.set_xticks(x, labels)
     ax.legend()
@@ -1624,11 +1816,6 @@ def prepare_scar_ecg_dataset(augment: bool, augment_percent: float, region_name:
         print(f'Accuracy = {round(statistics.mean(acc_list) * 100, 2)}%')
         print(f'F1 = {round(statistics.mean(f1_list) * 100, 2)}%')
         print(f'AUC = {round(statistics.mean(auc_list) * 100, 2)}%')
-
-
-
-
-
 
 
 def process_scar_ecg_for_ml():
@@ -1976,8 +2163,20 @@ def vcg_augmentation(ecg: np.ndarray):
 
     return pd.DataFrame(np.transpose(f1), columns=['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'])
 
+from collections import Counter
+
 
 if __name__ == '__main__':
+    # feature_multiple_comparison()
+    extractor = QTSegmentExtractor(ecg_dir_path=GlobalPaths.ecg_loc,
+                                   ann_dir_path=GlobalPaths.pla_annotation_loc,
+                                   metadata_path=GlobalPaths.ecg_meta_loc,
+                                   verbose=True)
+    extracted_segments_dict = extractor.extract_segments(debug=100)
+    ecg_feature_ds = get_ecg_feature_ds_uncertainty(extracted_segments_dict)
+
+
+
     # process_website_ecgs()
     # process_t_waves()
     # process_website_ecg_for_ml()
@@ -1987,7 +2186,7 @@ if __name__ == '__main__':
     # predict_scar_smote(region_name='Mid', select_top_features=True)
     # predict_scar_grid_search_rf(region_name='Mid', select_top_features=True)
     # predict_scar_grid_search_xgb(region_name='Mid', select_top_features=True)
-    feature_multiple_comparison()
+    # feature_multiple_comparison()
     # TODO -> Run train_test_split with shuffle to leave-out a test set, then run gridSearchCV with kfold = 5 on the
     #  train set to get the best_estimator, and then evaluate/predict the best_estimator using test set. Run the whole
     #  thing 10 times.

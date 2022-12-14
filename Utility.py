@@ -7,6 +7,9 @@ from numpy.linalg import norm
 import statistics as stat
 from functools import reduce
 from tslearn.metrics import dtw
+import MuseXMLX
+from MuseXMLX import MuseXmlParser
+import xml.parsers.expat
 
 
 class WaveBoundaryException(Exception):
@@ -124,11 +127,25 @@ class Util:
 class Loader:
 
     @staticmethod
-    def metadata(metadata_path: str):
+    def translate_muse_measurements(path_muse, path_save):
+        museXMLParser = MuseXmlParser()
+        expat_parser = xml.parsers.expat.ParserCreate()
+
+        museXMLX = MuseXMLX
+        museXMLX.g_Parser = museXMLParser
+        expat_parser.StartElementHandler = museXMLX.start_element
+        expat_parser.EndElementHandler = museXMLX.end_element
+        expat_parser.CharacterDataHandler = museXMLX.char_data
+
+        expat_parser.ParseFile(open(path_muse, 'rb'))
+        museXMLParser.makeZcg()
+        museXMLParser.writeCSV(path_save)
+    @staticmethod
+    def metadata(metadata_path: str, ecg_id_name: str = 'ECG ID', pid_name: str = 'Record_ID', frequency_name: str = 'Sample Base'):
         meta = pd.read_excel(metadata_path)
-        ecg_ids = list(meta['ECG ID'].values)
-        pid_list = list(meta['Record_ID'].values)
-        frequency_list = list(meta['Sample Base'].values)
+        ecg_ids = list(meta[ecg_id_name].values)
+        pid_list = list(meta[pid_name].values)
+        frequency_list = list(meta[frequency_name].values)
         return ecg_ids, pid_list, frequency_list
 
     @staticmethod
